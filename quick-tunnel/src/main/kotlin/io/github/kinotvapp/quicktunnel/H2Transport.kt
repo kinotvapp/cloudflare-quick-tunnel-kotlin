@@ -80,12 +80,18 @@ internal fun routeH2(req: Http2Request, ctx: H2Context) {
     }
 }
 
+/** How long to wait for the first body byte of a request that did not say whether it has one (Go uses 200 ms too). */
+internal const val BODY_PROBE_MS = 200L
+
 /** Rebuilds the HTTP/1.1 request the origin expects from the HTTP/2 pseudo-headers and headers. */
 internal fun toConnectReq(req: Http2Request): ConnectReq {
     val websocket = req.header(H2Headers.UPGRADE) == H2Headers.WEBSOCKET
     val regular = req.headers.filter { !it.first.startsWith(":") && !it.first.startsWith("cf-cloudflared-") }
-    // A body of unknown length (no Content-Length) has to be re-chunked for HTTP/1.1.
-    val chunk = !req.endStream && regular.none { it.first == "content-length" } && !websocket
+    // A body of unknown length (no Content-Length) has to be re-chunked for HTTP/1.1. But "no END_STREAM yet" does not mean
+    // there is a body: the edge often sends a GET as HEADERS plus an empty DATA(END_STREAM). Like Go's transport, wait a
+    // moment for the first byte, and treat an immediate end of stream as no body (a chunked GET confuses many origins).
+    val unknownLength = !req.endStream && regular.none { it.first == "content-length" } && !websocket
+    val chunk = unknownLength && req.probeBody(BODY_PROBE_MS) != false
     val metadata = ArrayList<Pair<String, String>>()
     metadata += HTTP_METHOD_KEY to (req.header(":method") ?: "GET")
     metadata += HTTP_HOST_KEY to (req.header(":authority") ?: "")

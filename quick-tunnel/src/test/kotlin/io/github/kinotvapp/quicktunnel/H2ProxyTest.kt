@@ -166,4 +166,45 @@ class H2ProxyTest {
             assertEquals(60, m.streams.get())
         }
     }
+
+    // The edge may send a GET as HEADERS (no END_STREAM) followed by an empty DATA(END_STREAM).
+    private fun getWithLateEnd(h: H2Harness, path: String, delayMs: Long): MiniH2Client.ClientStream {
+        val st = h.client.openStreaming("GET", path)
+        Thread.sleep(delayMs)
+        h.client.data(st.id, ByteArray(0), endStream = true)
+        return st
+    }
+
+    @Test fun `a GET whose END_STREAM arrives in a separate empty DATA frame is not sent as chunked`() {
+        val seen = java.util.concurrent.CompletableFuture<Map<String, String>>()
+        FakeOrigin { _, _, headers, _, out -> seen.complete(headers); out.respond("200 OK", "ok".toByteArray()); true }.use { o ->
+            val (h, _, _) = setup(o)
+            val st = getWithLateEnd(h, "/late", delayMs = 30)
+            assertEquals("ok", String(st.bodyBytes()))
+            val headers = seen.get(5, TimeUnit.SECONDS)
+            assertNull(headers["transfer-encoding"], "an empty body must not turn into a chunked request: $headers")
+            assertNull(headers["content-length"])
+        }
+    }
+
+    @Test fun `a body that really follows HEADERS is still re-chunked`() {
+        var te: String? = null
+        FakeOrigin { _, _, headers, body, out -> te = headers["transfer-encoding"]; out.respond("200 OK", body); true }.use { o ->
+            val (h, _, _) = setup(o)
+            val st = h.client.openStreaming("POST", "/slow")
+            Thread.sleep(30)
+            h.client.data(st.id, "payload".toByteArray(), endStream = true)
+            assertEquals("payload", String(st.bodyBytes())); assertEquals("chunked", te)
+        }
+    }
+
+    @Test fun `when the first byte is slower than the probe the request falls back to chunked`() {
+        var te: String? = null
+        FakeOrigin { _, _, headers, _, out -> te = headers["transfer-encoding"]; out.respond("200 OK", ByteArray(0)); true }.use { o ->
+            val (h, _, _) = setup(o)
+            val st = getWithLateEnd(h, "/very-late", delayMs = BODY_PROBE_MS + 300)
+            st.bodyBytes()
+            assertEquals("chunked", te, "undecided after the probe: safe default is a chunked request that ends right away")
+        }
+    }
 }

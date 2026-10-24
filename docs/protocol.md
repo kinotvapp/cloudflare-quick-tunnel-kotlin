@@ -60,7 +60,7 @@ The reply is the same preamble + `ConnectResponse` (`error ptr0`, `metadata ptr1
 
 Same port, different wire. Mirrors `connection/http2.go` and `connection/header.go` in `cloudflared`.
 
-- **Connect:** TCP to the edge, TLS with SNI `h2.cftunnel.com`, the same pinned CAs, **no ALPN**.
+- **Connect:** TCP to the edge, TLS **1.3 only** (a 1.2 ClientHello gets `protocol_version`) with SNI `h2.cftunnel.com`, the same pinned CAs, **no ALPN**.
 - **Roles are reversed:** after the handshake the edge is the HTTP/2 *client* and we are the *server*. We write nothing until
   the client preface arrives; then we send SETTINGS.
 - **Control stream:** the first request has `Cf-Cloudflared-Proxy-Connection-Upgrade: control-stream`. Answer `200` and run the
@@ -74,3 +74,17 @@ Same port, different wire. Mirrors `connection/http2.go` and `connection/header.
   `cf-cloudflared-response-headers`, as `base64raw(name):base64raw(value)` pairs joined by `;`. Add
   `cf-cloudflared-response-meta: {"src":"origin"}` (`"cloudflared"` for errors we generate, with a 502).
 - **Not needed:** a dynamic table in our HPACK encoder (literals without indexing are valid for any peer table size).
+
+### TLS 1.3 record layer notes (Tls13.kt)
+
+- Handshake messages are parsed and driven by agent15 (`TlsMessageParser`, `TlsClientEngine`); we supply the records. Order of
+  events at the end of the handshake: the engine calls `send(Finished)` (still under the handshake keys), then computes the
+  application secrets, then `handshakeFinished()`: switch both directions to application keys there, not before.
+- Record protection: AES-128-GCM, nonce = write IV xor the 64-bit sequence number, AAD = the 5-byte record header, inner
+  plaintext = content + content type (+ optional zero padding). Sequence numbers reset on every key change.
+- `KeyUpdate` (type 24): rotate the read keys as soon as it arrives. If `update_requested`, answer **on the next write**, not
+  from the reader thread: a reader that waits for the write lock can deadlock against a writer blocked on a full socket while the
+  peer is blocked writing to us. RFC 8446 only requires the reply before the next application data.
+- The JDK sends `user_canceled` (90) before `close_notify` when it closes; RFC 8446 section 6.1 says to ignore it.
+- Request bodies: a request without `Content-Length` and without END_STREAM on HEADERS may still be empty (the edge often sends
+  `DATA(END_STREAM)` separately). Wait ~200 ms for a first byte like Go's transport does, and only re-chunk if one arrives.

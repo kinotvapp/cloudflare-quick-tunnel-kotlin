@@ -62,30 +62,45 @@ private fun dialInThisThread(edge: EdgeAddr, onPeerStream: Consumer<QuicStream>,
 
 private val edgeTlsContext: SSLContext by lazy { SSLContext.getInstance("TLS").apply { init(null, arrayOf(edgeTrust), null) } }
 
+/** Which TLS implementation carries the TCP transport. */
+enum class TcpTls {
+    /** The platform's TLS when it speaks 1.3 (Android 10+, any current JDK), otherwise the pure-Java one below. */
+    AUTO,
+    PLATFORM,
+    /** Kwik's TLS 1.3 engine with our record layer ([Tls13Connection]). Works on every Android version. */
+    PURE_JAVA,
+}
+
+/** An established TLS connection to the edge, whichever implementation is behind it. */
+class TcpConnection(val input: java.io.InputStream, val output: java.io.OutputStream, private val closer: () -> Unit) : AutoCloseable {
+    override fun close() = closer()
+}
+
+/** The edge's TCP endpoint only speaks TLS 1.3, which the platform's TLS gained in Android 10. */
+fun platformTlsSupports13(): Boolean = runCatching { edgeTlsContext.supportedSSLParameters.protocols.contains("TLSv1.3") }.getOrDefault(false)
+
 /**
  * TLS over TCP to the same port, for networks that drop UDP. Server name `h2.cftunnel.com`, no ALPN (cloudflared sends
  * none for this protocol), same pinned CAs. The edge then speaks HTTP/2 as the *client* on this connection.
  */
-fun dialTcp(edge: EdgeAddr, timeoutS: Long = HANDSHAKE_TIMEOUT_S): SSLSocket {
+fun dialTcp(edge: EdgeAddr, timeoutS: Long = HANDSHAKE_TIMEOUT_S, tls: TcpTls = TcpTls.AUTO): TcpConnection {
+    val usePlatform = when (tls) { TcpTls.PLATFORM -> true; TcpTls.PURE_JAVA -> false; TcpTls.AUTO -> platformTlsSupports13() }
     val plain = Socket()
     try {
         plain.connect(InetSocketAddress(edge.ip, edge.port), (timeoutS * 1000).toInt())
         plain.tcpNoDelay = true
         plain.keepAlive = true
+        if (!usePlatform) {
+            val c = Tls13Connection.connect(plain, H2_SNI, edgeTrust, (timeoutS * 1000).toInt())
+            return TcpConnection(c.input, c.output) { c.close() }
+        }
         plain.soTimeout = (timeoutS * 1000).toInt() // bounds the handshake only
-        val tls = edgeTlsContext.socketFactory.createSocket(plain, H2_SNI, edge.port, true) as SSLSocket
-        tls.startHandshake()
-        tls.soTimeout = 0
-        return tls
+        val socket = edgeTlsContext.socketFactory.createSocket(plain, H2_SNI, edge.port, true) as SSLSocket
+        socket.startHandshake()
+        socket.soTimeout = 0
+        return TcpConnection(socket.inputStream, socket.outputStream) { runCatching { socket.close() } }
     } catch (e: Exception) {
         runCatching { plain.close() }
         throw e
     }
 }
-
-/**
- * The edge's TCP endpoint only speaks TLS 1.3 (a TLS 1.2 ClientHello gets `protocol_version`). The platform's TLS gained
- * 1.3 in Android 10, so on Android 7 to 9 the HTTP/2 transport cannot connect; QUIC does not care because Kwik carries
- * its own TLS 1.3.
- */
-fun http2TransportAvailable(): Boolean = runCatching { edgeTlsContext.supportedSSLParameters.protocols.contains("TLSv1.3") }.getOrDefault(false)

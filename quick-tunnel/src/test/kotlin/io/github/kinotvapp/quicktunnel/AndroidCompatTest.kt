@@ -50,7 +50,7 @@ class AndroidCompatTest {
         assertEquals(null, java.security.Security.getProvider("QuickTunnelEC"), "the JDK has EC parameters, so no provider is added")
     }
 
-    @Test fun `this JDK can speak TLS 1 3 so the HTTP2 transport is available`() {
-        assertTrue(http2TransportAvailable())
+    @Test fun `this JDK's own TLS speaks 1_3 so AUTO would pick the platform implementation`() {
+        assertTrue(platformTlsSupports13())
     }
 }

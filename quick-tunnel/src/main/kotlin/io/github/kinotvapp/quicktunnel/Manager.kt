@@ -117,8 +117,6 @@ class QuickTunnelHandle internal constructor(
         private val reactors = CopyOnWriteArrayList<Thread>()
         private val streamPool = Executors.newCachedThreadPool { r -> Thread(r, "cfqt-stream").apply { isDaemon = true } }
         @Volatile private var preferHttp2Until = 0L
-        // Only the real HTTP/2 dialer needs the platform's TLS 1.3; tests that inject their own dialer are not affected.
-        private val http2Usable = Transport.HTTP2 in dialOverrides || http2TransportAvailable()
         private val dialers: Map<Transport, EdgeDialer> = mapOf(Transport.QUIC to ::dialQuicLink, Transport.HTTP2 to ::dialHttp2Link) + dialOverrides
 
         fun transports(): Map<Int, Transport> = links.mapValues { it.value.transport }
@@ -149,8 +147,7 @@ class QuickTunnelHandle internal constructor(
         /** discover -> dial (QUIC, then HTTP/2 per policy) -> register. */
         fun connectCycle(connIndex: Int, replaceExisting: Boolean): Link {
             val edges = registry.get(config.ipVersion)
-            val order = transportOrder(config.transport, preferHttp2 = now() < preferHttp2Until).filter { it != Transport.HTTP2 || http2Usable }
-            if (order.isEmpty()) throw TunnelException.Internal("the HTTP/2 transport needs TLS 1.3, which this Android version lacks (Android 10+); use TransportPolicy.AUTO or QUIC_ONLY")
+            val order = transportOrder(config.transport, preferHttp2 = now() < preferHttp2Until)
             val errors = LinkedHashSet<String>() // one entry per distinct failure, so the first cause is not hidden by the last
             var quicError: String? = null
             for (transport in order) {
@@ -194,8 +191,8 @@ class QuickTunnelHandle internal constructor(
         }
 
         private fun dialHttp2Link(edge: EdgeAddr, connIndex: Int, replace: Boolean): Link {
-            val socket = dialTcp(edge)
-            return h2LinkOver(socket.inputStream, socket.outputStream, connIndex, replace) { runCatching { socket.close() } }
+            val connection = dialTcp(edge, tls = config.tcpTls)
+            return h2LinkOver(connection.input, connection.output, connIndex, replace) { runCatching { connection.close() } }
         }
 
         /** Everything after the TCP+TLS connection exists; split out so it can run over in-memory streams in tests. */
@@ -315,6 +312,8 @@ class QuickTunnelManager(
     val firstConnectTimeoutMs: Long = DEFAULT_FIRST_CONNECT_TIMEOUT_MS,
     val ipVersion: IpVersionFilter = IpVersionFilter.AUTO,
     val transport: TransportPolicy = TransportPolicy.AUTO,
+    /** Which TLS carries the TCP transport; the default picks the platform's when it can do TLS 1.3. */
+    val tcpTls: TcpTls = TcpTls.AUTO,
     val listener: TunnelListener = object : TunnelListener {},
     val maxReconnectAttempts: Int = Int.MAX_VALUE,
     private val registry: EdgeRegistry = EdgeRegistry(),

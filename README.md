@@ -21,15 +21,12 @@ Working end to end: a request to the public URL reaches a server on the device a
 | Where | What was verified |
 |---|---|
 | JDK 17, macOS | Full flow over **both transports**, HA failover, reconnect, 20 MB download and 5 MB upload with identical checksums, WebSocket echo over HTTP/2 |
-| **Android 7.0 emulator (API 24, arm64)** | Full flow over QUIC, 30/30 requests answered; mobile data off for 40 s and on again: both connections re-register within 1 s of the network returning. `minSdk 24` with core library desugaring |
+| **Android 7.0 emulator (API 24, arm64)** | QUIC: full flow, 30/30 requests answered; mobile data off for 40 s and on again, both connections re-register within 1 s of the network returning. **With UDP 7844 dropped by iptables:** `AUTO` falls back to HTTP/2 over TCP with the pure-Java TLS 1.3, tunnel up in 4.7 s, 40/40 requests and 20 in parallel. `minSdk 24` with core library desugaring |
 | Android 14 emulator (API 34, arm64) | Full flow; switching Wi-Fi off and on: ~4 s and ~2 s outages, both connections re-register on their own; R8-minified release build |
 | Samsung S24+ (Android 16) | Full flow with the app in the background (foreground service): tunnel up in 4.6 s, 30/30 requests answered, no reconnects needed |
 
 ## Limitations
 
-- **Not done yet: the TCP fallback on Android 7 to 9.** The library itself works on Android 7+ over QUIC; the HTTP/2-over-TCP
-  fallback currently uses the platform's TLS, which only speaks 1.3 from Android 10. That is a gap in this implementation, not
-  in Android 7: Kwik's own pure-Java TLS 1.3 could carry it (see [Android notes](#android-notes)).
 - **If both UDP and TCP to port 7844 are blocked, there is no fallback.** The tunnel needs outbound access to the edge on
   that port: UDP for QUIC, or TCP for the HTTP/2 transport (see [Transports](#transports)). Networks that only allow
   80/443 are out.
@@ -37,8 +34,8 @@ Working end to end: a request to the public URL reaches a server on the device a
 - Quick tunnels are anonymous and rate-limited; named tunnels (Cloudflare account + token) are out of scope.
 - No UDP/ICMP proxying (`datagram` v2/v3).
 
-Not verified: Android 8 to 13 (only 7.0, 14 and 16 were run; the polyfill and desugaring paths are the same for 8 to 13), a network that really blocks UDP 7844 (the fallback decision is covered by unit tests, and the HTTP/2 transport was verified on its own against the real edge), IPv6-only networks, long runs (hours), doze mode.
-138 unit tests run without network access (`./gradlew :quick-tunnel:test`).
+Not verified: Android 8 to 13 (only 7.0, 14 and 16 were run, so the platform-TLS fallback was only run on 14-class JDK and Android 16; the polyfill and desugaring paths are the same for 8 to 13), a network that *silently drops* UDP 7844 (the tests used a sandbox and iptables, which refuse immediately; a silent drop takes the 4 s handshake timeout per QUIC edge instead, which unit tests cover), IPv6-only networks, long runs (hours), doze mode.
+152 unit tests run without network access (`./gradlew :quick-tunnel:test`).
 
 ## What it does
 
@@ -68,6 +65,12 @@ Not verified: Android 8 to 13 (only 7.0, 14 and 16 were run; the polyfill and de
 that happens `TunnelListener.onTransportFallback` fires, and the next reconnections go straight to HTTP/2 for 10 minutes
 before QUIC is tried again, so a blocked network does not cost a timeout on every reconnect. `QUIC_ONLY` and `HTTP2_ONLY`
 force one of them. `handle.transports` tells which one each connection is using.
+
+**TLS for the TCP transport.** The edge's TCP endpoint only accepts TLS 1.3, which the platform gained in Android 10. So
+`TcpTls.AUTO` uses the platform's TLS where it speaks 1.3 (Android 10+, any current JDK) and otherwise a pure-Java TLS 1.3
+client (`Tls13.kt`): Kwik's own handshake engine, the one QUIC already runs on every Android version, plus a TLS record
+layer written for this library (AES-128-GCM, key updates, close_notify). It is checked against the JDK's TLS server and
+against the real edge, and it is what makes the TCP fallback work on Android 7 to 9. `PURE_JAVA` forces it anywhere.
 
 The HTTP/2 transport is a small server written for this library (`Http2.kt`): SETTINGS, HEADERS/CONTINUATION, DATA,
 flow control in both directions, PING, RST_STREAM, GOAWAY. HPACK decoding uses `com.twitter:hpack`.
@@ -103,9 +106,8 @@ See [`sample-android`](sample-android) for a working foreground service. What it
 - **Android 7 to 13 lack `AlgorithmParameters.getInstance("EC")`**, which Kwik's TLS uses for every handshake. The library installs a
   tiny JCA provider with the three NIST curves when the platform does not have it (`EcParametersPolyfill`, checked against the
   JDK's values by a unit test). Without it, QUIC fails on those versions with "Missing support for EC algorithm".
-- **The HTTP/2 fallback currently needs Android 10+.** The edge's TCP endpoint only accepts TLS 1.3, and the platform's TLS
-  gained it in Android 10. On Android 7 to 9 `AUTO` skips HTTP/2 and QUIC (UDP 7844) is what runs; `HTTP2_ONLY` fails with a
-  clear message. Everything else works on Android 7+.
+- **The TCP fallback runs on Android 7+ too.** The platform's TLS has no 1.3 before Android 10, and the edge's TCP endpoint
+  requires it, so on those versions the library uses its own pure-Java TLS 1.3 (see [Transports](#transports)).
 - **Call `reconnectNow()` when the network returns.** Besides closing the connections it wakes reactors sleeping in a reconnect
   backoff, so a phone that was offline for a minute is back in about a second instead of waiting out a 30 s retry.
 - **Do not run the handshake on pool threads without fixing the class loader.** Kwik finds its TLS key exchange with
@@ -116,7 +118,7 @@ See [`sample-android`](sample-android) for a working foreground service. What it
   `ByteBuffer.get(int, byte[])` (Java 13) that crash older Android versions with `NoSuchMethodError`. Java 9 to 11 APIs
   are not checked: The sample uses `minSdk 24` with core library desugaring (`java.time`) and works on Android 7.0.
 - R8 works with the three-line `proguard-rules.pro` in the sample. The whole sample app, tunnel included, is
-  about 235 KB as a release APK.
+  about 350 KB as a release APK (R8, unsigned), which includes the HTTP/2 transport and the pure-Java TLS.
 
 ## Repository layout
 

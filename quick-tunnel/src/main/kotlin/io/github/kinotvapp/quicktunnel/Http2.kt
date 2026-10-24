@@ -321,7 +321,7 @@ class Http2Connection(
         if (notified.compareAndSet(false, true)) onClosed(cause)
     }
 
-    private class BodyQueue : InputStream() {
+    private class BodyQueue : InputStream(), ProbeableBody {
         private val chunks = LinkedBlockingQueue<Any>()
         private var current: ByteArray? = null
         private var pos = 0
@@ -330,6 +330,20 @@ class Http2Connection(
         private var unacked = 0
         private var paddingCredit = 0
         private object End
+
+        /** One item taken from the queue by [probe] and not yet consumed by [read]. */
+        private var peeked: Any? = null
+
+        /**
+         * Waits up to [timeoutMs] for the first sign of the body: true when bytes are there, false when the body is empty
+         * (END_STREAM), null if nothing has arrived yet. Does not consume anything.
+         */
+        override fun probe(timeoutMs: Long): Boolean? {
+            val cur = current
+            if (cur != null && pos < cur.size) return true
+            val item = peeked ?: chunks.poll(timeoutMs, TimeUnit.MILLISECONDS)?.also { peeked = it } ?: return null
+            return item is ByteArray
+        }
 
         fun offer(b: ByteArray) { chunks.put(b) }
         fun padding(streamId: Int, n: Int) { synchronized(this) { paddingCredit += n } }
@@ -343,7 +357,7 @@ class Http2Connection(
             if (finished) return -1
             var cur = current
             if (cur == null || pos >= cur.size) {
-                when (val next = chunks.take()) {
+                when (val next = peeked?.also { peeked = null } ?: chunks.take()) {
                     is ByteArray -> { cur = next; current = next; pos = 0 }
                     is Throwable -> { finished = true; throw IOException(next.message, next) }
                     else -> { finished = true; return -1 }
@@ -400,7 +414,16 @@ class Http2Request internal constructor(
     val done: CompletableFuture<Unit>,
 ) {
     fun header(name: String) = headers.firstOrNull { it.first == name }?.second
+
+    /**
+     * Whether a body follows when HEADERS did not carry END_STREAM: the edge sometimes sends a GET as HEADERS and then an
+     * empty DATA with END_STREAM. true = bytes arrived, false = empty body, null = still undecided after [timeoutMs].
+     */
+    fun probeBody(timeoutMs: Long): Boolean? = (body as? ProbeableBody)?.probe(timeoutMs)
 }
+
+/** A request body that can be peeked at without consuming it. */
+internal interface ProbeableBody { fun probe(timeoutMs: Long): Boolean? }
 
 class Http2Response internal constructor(private val connection: Http2Connection, private val stream: Any) {
     @Volatile var headersSent = false
