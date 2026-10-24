@@ -30,6 +30,12 @@ class EdgeTest {
         reg.invalidate(); reg.get(IpVersionFilter.V4_ONLY); assertEquals(3, calls)
     }
 
+    @Test fun `registry keeps IPv4 edges ahead of IPv6 on every call`() {
+        val all = listOf("2606:4700:a0::1", "198.41.192.1", "2606:4700:a0::2", "198.41.192.2", "198.41.192.3").map { edge(it) }
+        val reg = EdgeRegistry(discover = { all })
+        repeat(20) { val got = reg.get(IpVersionFilter.AUTO); assertTrue(got.take(3).all { it.isV4 } && got.drop(3).none { it.isV4 }, got.toString()) }
+    }
+
     @Test fun `registry returns every edge in some order`() {
         val all = (1..8).map { edge("198.41.192.$it") }
         val got = EdgeRegistry(discover = { all }).get(IpVersionFilter.AUTO)

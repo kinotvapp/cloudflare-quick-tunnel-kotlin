@@ -35,6 +35,7 @@ fun dial(edge: EdgeAddr, onPeerStream: Consumer<QuicStream>, handshakeTimeoutS: 
     // Kwik finds its TLS key exchange with ServiceLoader, which reads the thread's context class loader.
     // On Android, pool threads (ForkJoinPool, executors) get the system loader, which cannot see the APK's
     // META-INF/services: the handshake then fails with "Unsupported named group(s)".
+    EcParametersPolyfill.ensureInstalled()
     val thread = Thread.currentThread()
     val previous = thread.contextClassLoader
     thread.contextClassLoader = QuicClientConnection::class.java.classLoader
@@ -81,3 +82,10 @@ fun dialTcp(edge: EdgeAddr, timeoutS: Long = HANDSHAKE_TIMEOUT_S): SSLSocket {
         throw e
     }
 }
+
+/**
+ * The edge's TCP endpoint only speaks TLS 1.3 (a TLS 1.2 ClientHello gets `protocol_version`). The platform's TLS gained
+ * 1.3 in Android 10, so on Android 7 to 9 the HTTP/2 transport cannot connect; QUIC does not care because Kwik carries
+ * its own TLS 1.3.
+ */
+fun http2TransportAvailable(): Boolean = runCatching { edgeTlsContext.supportedSSLParameters.protocols.contains("TLSv1.3") }.getOrDefault(false)

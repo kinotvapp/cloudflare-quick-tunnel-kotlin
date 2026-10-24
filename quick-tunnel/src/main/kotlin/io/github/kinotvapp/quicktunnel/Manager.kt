@@ -9,6 +9,8 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import kotlin.concurrent.thread
 
 const val CLIENT_VERSION = "kino-quick-tunnel/0.2"
@@ -85,8 +87,11 @@ class QuickTunnelHandle internal constructor(
     /** Transport each connection index is currently registered over. */
     val transports: Map<Int, Transport> get() = runtime.transports()
 
-    /** Close every connection so each reactor reconnects now (call when the device network changes). */
-    fun reconnectNow() = runtime.dropAll("reconnect requested")
+    /**
+     * Call when the device network changes or comes back. Closes every connection so each one reconnects, and cuts short
+     * any reconnect backoff in progress: after being offline for a minute the next retry would otherwise be up to 30 s away.
+     */
+    fun reconnectNow() = runtime.reconnectNow()
 
     /** Test hook: drop a single connection. */
     fun dropConnection(connIndex: Int) = runtime.drop(connIndex, "dropped by caller")
@@ -112,15 +117,41 @@ class QuickTunnelHandle internal constructor(
         private val reactors = CopyOnWriteArrayList<Thread>()
         private val streamPool = Executors.newCachedThreadPool { r -> Thread(r, "cfqt-stream").apply { isDaemon = true } }
         @Volatile private var preferHttp2Until = 0L
+        // Only the real HTTP/2 dialer needs the platform's TLS 1.3; tests that inject their own dialer are not affected.
+        private val http2Usable = Transport.HTTP2 in dialOverrides || http2TransportAvailable()
         private val dialers: Map<Transport, EdgeDialer> = mapOf(Transport.QUIC to ::dialQuicLink, Transport.HTTP2 to ::dialHttp2Link) + dialOverrides
 
         fun transports(): Map<Int, Transport> = links.mapValues { it.value.transport }
 
+        private val kickLock = ReentrantLock()
+        private val kicked = kickLock.newCondition()
+        private var kickGeneration = 0
+
+        private enum class Wake { ELAPSED, KICKED, STOPPED }
+
+        /** Wakes every reactor that is sleeping in a reconnect backoff. */
+        fun kick() = kickLock.withLock { kickGeneration++; kicked.signalAll() }
+
+        fun reconnectNow() { dropAll("reconnect requested"); kick() }
+
+        /** Sleeps up to [ms], or less if the network came back ([kick]) or we are shutting down. */
+        private fun sleepOrWake(ms: Long): Wake = kickLock.withLock {
+            val generation = kickGeneration
+            var left = TimeUnit.MILLISECONDS.toNanos(ms)
+            while (left > 0) {
+                if (stopped.get()) return Wake.STOPPED
+                if (kickGeneration != generation) return Wake.KICKED
+                left = kicked.awaitNanos(left)
+            }
+            if (stopped.get()) Wake.STOPPED else Wake.ELAPSED
+        }
+
         /** discover -> dial (QUIC, then HTTP/2 per policy) -> register. */
         fun connectCycle(connIndex: Int, replaceExisting: Boolean): Link {
             val edges = registry.get(config.ipVersion)
-            val order = transportOrder(config.transport, preferHttp2 = now() < preferHttp2Until)
-            var last = "no edges"
+            val order = transportOrder(config.transport, preferHttp2 = now() < preferHttp2Until).filter { it != Transport.HTTP2 || http2Usable }
+            if (order.isEmpty()) throw TunnelException.Internal("the HTTP/2 transport needs TLS 1.3, which this Android version lacks (Android 10+); use TransportPolicy.AUTO or QUIC_ONLY")
+            val errors = LinkedHashSet<String>() // one entry per distinct failure, so the first cause is not hidden by the last
             var quicError: String? = null
             for (transport in order) {
                 val tryEdges = if (transport == Transport.QUIC && order.size > 1) edges.take(AUTO_QUIC_EDGES) else edges.take(MAX_EDGES_PER_CYCLE)
@@ -136,13 +167,14 @@ class QuickTunnelHandle internal constructor(
                     } catch (e: TunnelException.Register) {
                         throw e // the edge refused us: another address or transport will not change that
                     } catch (e: Exception) {
-                        last = "$transport $edge: ${e.message}"
-                        if (transport == Transport.QUIC) quicError = last
+                        val reason = "$transport $edge: ${e.javaClass.simpleName}: ${e.message}"
+                        errors += reason
+                        if (transport == Transport.QUIC) quicError = reason
                     }
                 }
             }
             registry.invalidate() // every cached edge failed: the pool may have changed
-            throw TunnelException.QuicDial(edges.size, last)
+            throw TunnelException.QuicDial(edges.size, errors.take(6).joinToString(" | ").ifEmpty { "no edges" })
         }
 
         private fun dialQuicLink(edge: EdgeAddr, connIndex: Int, replace: Boolean): Link {
@@ -211,6 +243,7 @@ class QuickTunnelHandle internal constructor(
         }
 
         private fun reactor(connIndex: Int, initial: Link?, firstTryImmediately: Boolean) {
+            var immediate = firstTryImmediately // only the very first attempt skips the delay
             var link = initial
             var replace = false
             var attempt = 0
@@ -219,10 +252,15 @@ class QuickTunnelHandle internal constructor(
                 if (link == null) {
                     attempt++
                     if (attempt > config.maxReconnectAttempts) { config.listener.onGaveUp(connIndex, attempt - 1); return }
-                    val delay = if (attempt == 1 && firstTryImmediately && !replace) 0L else backoffMillis(attempt)
+                    val delay = if (immediate && attempt == 1 && !replace) 0L else backoffMillis(attempt)
+                    immediate = false
                     if (delay > 0) {
                         config.listener.onReconnecting(connIndex, attempt, delay)
-                        if (waitStop(delay)) return
+                        when (sleepOrWake(delay)) {
+                            Wake.STOPPED -> return
+                            Wake.KICKED -> attempt = 0 // the network is back: try right now (a free try), and restart the backoff curve
+                            Wake.ELAPSED -> {}
+                        }
                     }
                     link = try {
                         connectCycle(connIndex, replace)
@@ -250,14 +288,13 @@ class QuickTunnelHandle internal constructor(
             link?.closeGracefully()
         }
 
-        private fun waitStop(ms: Long): Boolean = try { stopSignal.get(ms, TimeUnit.MILLISECONDS); true } catch (_: TimeoutException) { false }
-
         fun drop(connIndex: Int, reason: String) { links[connIndex]?.let { it.lost.complete(reason); it.close() } }
         fun dropAll(reason: String) = links.keys.forEach { drop(it, reason) }
 
         fun shutdown() {
             if (!stopped.compareAndSet(false, true)) return
             stopSignal.complete(Unit)
+            kick() // wake reactors that are sleeping in a backoff
             reactors.forEach { it.join((UNREGISTER_GRACE_S + 5) * 1000) }
             streamPool.shutdownNow()
             pool.close()

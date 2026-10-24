@@ -102,11 +102,14 @@ class EdgeRegistry(
     private var cached: Cached? = null
 
     @Synchronized fun get(filter: IpVersionFilter): List<EdgeAddr> {
-        cached?.takeIf { it.filter == filter && it.expiresAt > now() }?.let { return it.edges.shuffled() }
+        cached?.takeIf { it.filter == filter && it.expiresAt > now() }?.let { return it.edges.shuffledByFamily() }
         val edges = discover(filter)
         cached = Cached(edges, now() + ttlMs, filter)
-        return edges.shuffled()
+        return edges.shuffledByFamily()
     }
+
+    /** A fresh order each call, but IPv4 stays first: a network without IPv6 would otherwise burn timeouts on dead addresses. */
+    private fun List<EdgeAddr>.shuffledByFamily() = partition { it.isV4 }.let { (v4, v6) -> v4.shuffled() + v6.shuffled() }
 
     /** Call when every cached edge failed: the pool may have changed. */
     @Synchronized fun invalidate() { cached = null }

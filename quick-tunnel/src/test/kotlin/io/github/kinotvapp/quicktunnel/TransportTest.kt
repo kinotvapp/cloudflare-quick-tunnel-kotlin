@@ -166,4 +166,47 @@ class TransportTest {
         client.close()
         assertNotNull(link.lost.get(10, TimeUnit.SECONDS))
     }
+
+    // ── reconnect backoff vs. the network coming back ────────────────────────
+
+    private class Events : TunnelListener {
+        val reconnecting = CopyOnWriteArrayList<Pair<Int, Long>>()
+        override fun onReconnecting(connIndex: Int, attempt: Int, delayMs: Long) { reconnecting += attempt to delayMs }
+    }
+
+    @Test fun `reconnectNow cuts a backoff short instead of waiting it out`() {
+        val tries = java.util.concurrent.atomic.AtomicInteger()
+        val failing: EdgeDialer = { _, _, _ -> tries.incrementAndGet(); throw IOException("network is unreachable") }
+        val events = Events()
+        val cfg = QuickTunnelManager(1, transport = TransportPolicy.QUIC_ONLY, listener = events, registry = EdgeRegistry(discover = { edges }))
+        val rt = QuickTunnelHandle.Runtime(cfg, tunnel, EdgeRegistry(discover = { edges }), mapOf(Transport.QUIC to failing)).also { open += AutoCloseable { it.shutdown() } }
+        rt.startReactor(0, null, firstTryImmediately = true)
+
+        // Wait until it is sleeping in a multi-second backoff.
+        val end = System.currentTimeMillis() + 15_000
+        while (events.reconnecting.none { it.second >= 4_000 } && System.currentTimeMillis() < end) Thread.sleep(20)
+        assertTrue(events.reconnecting.any { it.second >= 4_000 }, "never reached a long backoff: ${events.reconnecting}")
+        val before = tries.get()
+
+        rt.reconnectNow()
+        val deadline = System.currentTimeMillis() + 1_500
+        while (tries.get() == before && System.currentTimeMillis() < deadline) Thread.sleep(10)
+        assertTrue(tries.get() > before, "the reactor kept sleeping its backoff after the network came back")
+        // ...and the backoff curve starts over rather than continuing from where it was.
+        val after = events.reconnecting.last()
+        assertEquals(1_000L, after.second, "next delay after a kick is the first step of the curve: $after")
+    }
+
+    @Test fun `shutdown wakes reactors that are sleeping in a backoff`() {
+        val failing: EdgeDialer = { _, _, _ -> throw IOException("down") }
+        val events = Events()
+        val cfg = QuickTunnelManager(1, transport = TransportPolicy.QUIC_ONLY, listener = events, registry = EdgeRegistry(discover = { edges }))
+        val rt = QuickTunnelHandle.Runtime(cfg, tunnel, EdgeRegistry(discover = { edges }), mapOf(Transport.QUIC to failing))
+        rt.startReactor(0, null, firstTryImmediately = true)
+        val end = System.currentTimeMillis() + 15_000
+        while (events.reconnecting.none { it.second >= 4_000 } && System.currentTimeMillis() < end) Thread.sleep(20)
+        val t0 = System.currentTimeMillis()
+        rt.shutdown()
+        assertTrue(System.currentTimeMillis() - t0 < 2_000, "shutdown must not wait for the backoff to elapse")
+    }
 }

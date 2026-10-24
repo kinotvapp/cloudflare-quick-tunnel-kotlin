@@ -7,6 +7,7 @@ import android.app.Service
 import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
+import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import io.github.kinotvapp.quicktunnel.QuickTunnelHandle
@@ -37,9 +38,13 @@ class TunnelService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == "stop") { stop(); return START_NOT_STICKY }
         if (handle != null || server != null) return START_STICKY
-        val nm = getSystemService(NotificationManager::class.java)
-        nm.createNotificationChannel(NotificationChannel("qt", "Tunnel", NotificationManager.IMPORTANCE_LOW))
-        startForeground(1, Notification.Builder(this, "qt").setContentTitle("Tunnel running").setSmallIcon(android.R.drawable.stat_notify_sync).build())
+        val builder = if (Build.VERSION.SDK_INT >= 26) {
+            getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel("qt", "Tunnel", NotificationManager.IMPORTANCE_LOW))
+            Notification.Builder(this, "qt")
+        } else {
+            @Suppress("DEPRECATION") Notification.Builder(this)
+        }
+        startForeground(1, builder.setContentTitle("Tunnel running").setSmallIcon(android.R.drawable.stat_notify_sync).build())
         getSystemService(ConnectivityManager::class.java).registerDefaultNetworkCallback(netCallback)
         startLocalServer()
         thread(name = "qt-start") {
