@@ -1,0 +1,7 @@
+-dontwarn org.slf4j.**
+-dontwarn java.lang.management.**
+-dontwarn javax.naming.**
+-dontwarn sun.net.spi.nameservice.**
+-dontwarn java.net.spi.**
+-dontwarn org.xbill.DNS.**
+-dontwarn kotlinx.serialization.**
