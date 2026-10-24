@@ -58,7 +58,11 @@ interface TunnelListener {
     fun onReconnecting(connIndex: Int, attempt: Int, delayMs: Long) {}
     fun onReconnectFailed(connIndex: Int, attempt: Int, error: TunnelException) {}
     fun onGaveUp(connIndex: Int, attempts: Int) {}
+    /** [QuickTunnelManager.maxLifetimeMs] or [QuickTunnelManager.maxRequests] was reached; the tunnel is being closed. */
+    fun onLimitReached(limit: TunnelLimit) {}
 }
+
+enum class TunnelLimit { LIFETIME, REQUESTS }
 
 /** One registered connection to the edge, over either transport. */
 internal class Link(
@@ -285,6 +289,27 @@ class QuickTunnelHandle internal constructor(
             link?.closeGracefully()
         }
 
+        private val limitFired = AtomicBoolean(false)
+
+        /** Called when [QuickTunnelManager.maxLifetimeMs] or [QuickTunnelManager.maxRequests] is reached. Closes on its own thread. */
+        fun limitReached(limit: TunnelLimit) {
+            if (!limitFired.compareAndSet(false, true) || stopped.get()) return
+            config.listener.onLimitReached(limit)
+            thread(isDaemon = true, name = "cfqt-limit-close") { shutdown() } // a reactor or stream thread must not join itself
+        }
+
+        /** Starts the lifetime timer and the request counter configured on the manager. */
+        fun startLimits() {
+            if (config.maxRequests > 0) {
+                metrics.onCompleted = { if (metrics.completed.get() >= config.maxRequests) limitReached(TunnelLimit.REQUESTS) }
+            }
+            if (config.maxLifetimeMs > 0) {
+                thread(isDaemon = true, name = "cfqt-lifetime") {
+                    try { stopSignal.get(config.maxLifetimeMs, TimeUnit.MILLISECONDS) } catch (_: TimeoutException) { limitReached(TunnelLimit.LIFETIME) }
+                }
+            }
+        }
+
         fun drop(connIndex: Int, reason: String) { links[connIndex]?.let { it.lost.complete(reason); it.close() } }
         fun dropAll(reason: String) = links.keys.forEach { drop(it, reason) }
 
@@ -316,6 +341,10 @@ class QuickTunnelManager(
     val tcpTls: TcpTls = TcpTls.AUTO,
     val listener: TunnelListener = object : TunnelListener {},
     val maxReconnectAttempts: Int = Int.MAX_VALUE,
+    /** Close the tunnel this long after [start] returns. 0 = no limit. [TunnelListener.onLimitReached] fires first. */
+    val maxLifetimeMs: Long = 0,
+    /** Close the tunnel once this many edge-opened requests have been served (a request counts when it finishes). 0 = no limit. */
+    val maxRequests: Long = 0,
     private val registry: EdgeRegistry = EdgeRegistry(),
 ) {
     val haConnections: Int = haConnections.coerceIn(1, MAX_HA_CONNECTIONS)
@@ -337,6 +366,7 @@ class QuickTunnelManager(
         }
         rt.startReactor(0, first, firstTryImmediately = false)
         for (idx in 1 until haConnections) rt.startReactor(idx, null, firstTryImmediately = true)
+        rt.startLimits()
         return QuickTunnelHandle(tunnel.url, first.location, rt)
     }
 }

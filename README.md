@@ -24,6 +24,9 @@ Working end to end: a request to the public URL reaches a server on the device a
 | **Android 7.0 emulator (API 24, arm64)** | QUIC: full flow, 30/30 requests answered; mobile data off for 40 s and on again, both connections re-register within 1 s of the network returning. **With UDP 7844 dropped by iptables:** `AUTO` falls back to HTTP/2 over TCP with the pure-Java TLS 1.3, tunnel up in 4.7 s, 40/40 requests and 20 in parallel. `minSdk 24` with core library desugaring |
 | Android 14 emulator (API 34, arm64) | Full flow; switching Wi-Fi off and on: ~4 s and ~2 s outages, both connections re-register on their own; R8-minified release build |
 | Samsung S24+ (Android 16) | Full flow with the app in the background (foreground service): tunnel up in 4.6 s, 30/30 requests answered, no reconnects needed |
+| Samsung S24+ (Android 16), HTTP/2 only | The **platform-TLS** path on a real device: tunnel up in 5.0 s over HTTP/2 alone, 40/40 requests and 20 in parallel |
+| **Android 7.0 emulator limited to 1 GB RAM, 2 cores** (heap growth limit 48 MB) | 3-minute tunnels with light traffic plus 150 KB uploads, 64/64 requests each. **QUIC:** peak RSS 101 MB (mostly shared system pages), own memory (PSS) at most 24 MB, Java heap at most 7.6 MB, native heap 5.3 MB, 35 threads, 4 s of CPU. **HTTP/2 + pure-Java TLS (UDP blocked):** PSS at most 23 MB, Java heap 6.7 MB, 30 threads, 2 s of CPU. No low-memory kills. The host CPU is much faster than a TV box, so read the CPU figure as a floor |
+| Limits | `maxRequests` and `maxLifetimeMs` close the tunnel against the real edge (the next request gets 530), and are covered by unit tests, including closing from inside the callback |
 
 ## Limitations
 
@@ -34,8 +37,8 @@ Working end to end: a request to the public URL reaches a server on the device a
 - Quick tunnels are anonymous and rate-limited; named tunnels (Cloudflare account + token) are out of scope.
 - No UDP/ICMP proxying (`datagram` v2/v3).
 
-Not verified: Android 8 to 13 (only 7.0, 14 and 16 were run, so the platform-TLS fallback was only run on 14-class JDK and Android 16; the polyfill and desugaring paths are the same for 8 to 13), a network that *silently drops* UDP 7844 (the tests used a sandbox and iptables, which refuse immediately; a silent drop takes the 4 s handshake timeout per QUIC edge instead, which unit tests cover), IPv6-only networks, long runs (hours), doze mode.
-152 unit tests run without network access (`./gradlew :quick-tunnel:test`).
+Not verified: Android 8 to 13 and real devices below Android 14 (only 7.0 (emulator), 14 (emulator) and 16 (device) were run; the platform-TLS path ran on a JDK and on Android 16 only; the polyfill and desugaring paths are the same for 8 to 13), a network that *silently drops* UDP 7844 (the tests used a sandbox and iptables, which refuse immediately; a silent drop takes the 4 s handshake timeout per QUIC edge instead, which unit tests cover), IPv6-only networks, long runs (hours), doze mode.
+159 unit tests run without network access (`./gradlew :quick-tunnel:test`).
 
 ## What it does
 
@@ -85,9 +88,12 @@ val manager = QuickTunnelManager(
     ipVersion = IpVersionFilter.AUTO,           // or V4_ONLY / V6_ONLY
     firstConnectTimeoutMs = 30_000,
     maxReconnectAttempts = Int.MAX_VALUE,       // the Rust crate stops after 10; a phone should keep trying
+    maxLifetimeMs = 180_000,                    // close the tunnel 3 minutes after start() returns (0 = no limit)
+    maxRequests = 1,                            // ...or once this many requests have been served (0 = no limit)
     listener = object : TunnelListener {
         override fun onRegistered(connIndex: Int, location: String) = println("conn $connIndex on $location")
         override fun onLost(connIndex: Int, reason: String) = println("lost $connIndex: $reason")
+        override fun onLimitReached(limit: TunnelLimit) = println("closing: $limit")   // LIFETIME or REQUESTS
     },
 )
 manager.start().use { tunnel -> /* tunnel.url, tunnel.metrics */ }
@@ -119,6 +125,31 @@ See [`sample-android`](sample-android) for a working foreground service. What it
   are not checked: The sample uses `minSdk 24` with core library desugaring (`java.time`) and works on Android 7.0.
 - R8 works with the three-line `proguard-rules.pro` in the sample. The whole sample app, tunnel included, is
   about 350 KB as a release APK (R8, unsigned), which includes the HTTP/2 transport and the pure-Java TLS.
+
+## Network destinations
+
+Everything the library talks to, for allowlists and firewalls:
+
+| What | Where | Port |
+|---|---|---|
+| Ask for a tunnel | `https://api.trycloudflare.com/tunnel` (system trust store) | TCP 443 |
+| Edge discovery (SRV) and edge addresses | DNS queries for `_v2-origintunneld._tcp.argotunnel.com` and its targets (`regionN.v2.argotunnel.com`), sent **by the library itself** to public resolvers because Android has no SRV API: `1.1.1.1` (UDP 53, then TCP 53), `1.0.0.1` (UDP 53), `8.8.8.8` (UDP 53), and finally DNS-over-TLS to `1.1.1.1` (TCP 853, name `cloudflare-dns.com`). The first resolver that answers wins; normally only `1.1.1.1` over UDP 53 is used. | UDP/TCP 53, TCP 853 |
+| The tunnel itself | Cloudflare edge addresses returned by that lookup (seen so far in `198.41.192.0/24`, `198.41.200.0/24`, `2606:4700:a0::/48` and `2606:4700:a8::/48`) | **UDP 7844** (QUIC) or **TCP 7844** (HTTP/2) |
+| Names used only as TLS server names, never resolved | `quic.cftunnel.com`, `h2.cftunnel.com` | - |
+| What visitors use | `https://<random>.trycloudflare.com`: this is the *other* device's traffic, not the app's | - |
+
+`QUIC_ONLY` needs UDP 7844 only, `HTTP2_ONLY` TCP 7844 only. The default `AUTO` may use both.
+
+## Requirements and size
+
+- **minSdk 24.** Below Android 8 (API 26) the app needs **core library desugaring** (`desugar_jdk_libs`, AGP 7.4+): both Kwik and
+  dnsjava use `java.time`, which Android 7 lacks. Without it the tunnel fails on Android 7 with
+  `NoClassDefFoundError: java.time.Duration` (checked on the API 24 emulator; the failure is in the DNS step, before any Kwik
+  code, so removing Kwik alone would not remove the need). Android 8+ needs nothing extra.
+- **Size added to a release APK after R8, dex only (there is no native code):** about **496 KB** of `classes.dex` without
+  desugaring and about **688 KB** with it (the `j$.*` classes add ~190 KB). Measured on the sample app: an empty app is
+  1 KB of dex; the sample release APK is 254 KB without and 341 KB with desugaring. The figures include the sample's own few KB.
+- R8 rules: `sample-android/proguard-rules.pro` (`-dontwarn` for classes dnsjava and Kotlin serialization reference but never use).
 
 ## Repository layout
 

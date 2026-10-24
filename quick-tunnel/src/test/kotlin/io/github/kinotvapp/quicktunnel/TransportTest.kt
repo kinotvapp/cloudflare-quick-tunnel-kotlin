@@ -209,4 +209,76 @@ class TransportTest {
         rt.shutdown()
         assertTrue(System.currentTimeMillis() - t0 < 2_000, "shutdown must not wait for the backoff to elapse")
     }
+
+    // ── lifetime and request limits ──────────────────────────────────────────
+
+    private class LimitEvents : TunnelListener {
+        val limits = CopyOnWriteArrayList<TunnelLimit>()
+        override fun onLimitReached(limit: TunnelLimit) { limits += limit }
+    }
+
+    private fun limitRuntime(events: LimitEvents, maxLifetimeMs: Long = 0, maxRequests: Long = 0): QuickTunnelHandle.Runtime {
+        val reg = EdgeRegistry(discover = { edges })
+        val cfg = QuickTunnelManager(1, listener = events, maxLifetimeMs = maxLifetimeMs, maxRequests = maxRequests, registry = reg)
+        val rt = QuickTunnelHandle.Runtime(cfg, tunnel, reg, emptyMap())
+        rt.startLimits()
+        open += AutoCloseable { rt.shutdown() }
+        return rt
+    }
+
+    private fun serveOne(rt: QuickTunnelHandle.Runtime) = serve(QuicSink(ByteArrayOutputStream()), rt.metrics) { }
+
+    @Test fun `maxRequests closes the tunnel when the last allowed request finishes`() {
+        val events = LimitEvents(); val rt = limitRuntime(events, maxRequests = 3)
+        serveOne(rt); serveOne(rt)
+        assertTrue(events.limits.isEmpty(), "two of three: still open")
+        serveOne(rt)
+        assertEquals(listOf(TunnelLimit.REQUESTS), events.limits)
+    }
+
+    @Test fun `a failed request still counts as served`() {
+        val events = LimitEvents(); val rt = limitRuntime(events, maxRequests = 1)
+        serve(QuicSink(ByteArrayOutputStream()), rt.metrics) { error("origin exploded") }
+        assertEquals(listOf(TunnelLimit.REQUESTS), events.limits)
+    }
+
+    @Test fun `the limit callback fires once even if more requests keep arriving`() {
+        val events = LimitEvents(); val rt = limitRuntime(events, maxRequests = 1)
+        repeat(5) { serveOne(rt) }
+        assertEquals(1, events.limits.size)
+    }
+
+    @Test fun `no limits means no callback`() {
+        val events = LimitEvents(); val rt = limitRuntime(events)
+        repeat(20) { serveOne(rt) }
+        Thread.sleep(200)
+        assertTrue(events.limits.isEmpty())
+    }
+
+    @Test fun `maxLifetimeMs closes the tunnel after that long`() {
+        val events = LimitEvents(); val t0 = System.currentTimeMillis()
+        limitRuntime(events, maxLifetimeMs = 300)
+        val end = t0 + 5_000
+        while (events.limits.isEmpty() && System.currentTimeMillis() < end) Thread.sleep(10)
+        assertEquals(listOf(TunnelLimit.LIFETIME), events.limits)
+        assertTrue(System.currentTimeMillis() - t0 in 250..3_000)
+    }
+
+    @Test fun `closing earlier cancels the lifetime timer`() {
+        val events = LimitEvents(); val rt = limitRuntime(events, maxLifetimeMs = 400)
+        rt.shutdown()
+        Thread.sleep(800)
+        assertTrue(events.limits.isEmpty(), "a tunnel closed by hand must not report a limit afterwards")
+    }
+
+    @Test fun `closing from inside the limit callback does not deadlock`() {
+        val closed = CompletableFuture<Unit>()
+        lateinit var rt: QuickTunnelHandle.Runtime
+        val listener = object : TunnelListener { override fun onLimitReached(limit: TunnelLimit) { rt.shutdown(); closed.complete(Unit) } }
+        val reg = EdgeRegistry(discover = { edges })
+        rt = QuickTunnelHandle.Runtime(QuickTunnelManager(1, listener = listener, maxRequests = 1, registry = reg), tunnel, reg, emptyMap())
+        rt.startLimits()
+        serveOne(rt)
+        closed.get(5, TimeUnit.SECONDS)
+    }
 }

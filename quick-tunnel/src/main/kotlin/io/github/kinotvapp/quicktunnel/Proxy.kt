@@ -22,7 +22,11 @@ private const val TYPE_TCP = 2
 
 class TunnelMetrics {
     val streams = AtomicLong(); val bytesIn = AtomicLong(); val bytesOut = AtomicLong(); val reconnects = AtomicLong()
-    override fun toString() = "streams=$streams in=$bytesIn out=$bytesOut reconnects=$reconnects"
+
+    /** Edge-opened streams that have finished, successfully or not. */
+    val completed = AtomicLong()
+    @Volatile internal var onCompleted: (() -> Unit)? = null
+    override fun toString() = "streams=$streams completed=$completed in=$bytesIn out=$bytesOut reconnects=$reconnects"
 }
 
 class ConnectReq(val dest: String, val type: Int, val metadata: List<Pair<String, String>>, val chunkRequestBody: Boolean = false) {
@@ -188,6 +192,8 @@ internal fun serve(sink: ResponseSink, m: TunnelMetrics, block: (onStarted: () -
         if (!started) runCatching { sink.error(502, "proxy error: ${e.message}") }
     } finally {
         sink.finish()
+        m.completed.incrementAndGet()
+        m.onCompleted?.invoke()
     }
 }
 
