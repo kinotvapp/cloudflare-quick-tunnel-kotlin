@@ -8,7 +8,6 @@ version = "0.1.0"
 dependencies {
     // Kwik (QUIC + TLS 1.3 in pure Java) is LGPL-3.0: see THIRD_PARTY_NOTICES.md.
     api("tech.kwik:kwik:0.12.1")
-    implementation("tech.kwik:agent15:4.0") // Kwik's TLS 1.3 engine, also used directly for the TCP transport (Tls13.kt)
     implementation("dnsjava:dnsjava:3.6.2")
     implementation("com.twitter:hpack:1.0.2") // HPACK decoding (Huffman + dynamic table) for the HTTP/2 fallback
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")

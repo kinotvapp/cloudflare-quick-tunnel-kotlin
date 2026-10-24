@@ -1,32 +1,16 @@
 package io.github.kinotvapp.quicktunnel
 
-import tech.kwik.agent15.NewSessionTicket
-import tech.kwik.agent15.ProtectionKeysType
-import tech.kwik.agent15.TlsConstants
-import tech.kwik.agent15.TlsProtocolException
-import tech.kwik.agent15.engine.ClientMessageSender
-import tech.kwik.agent15.engine.TlsClientEngine
-import tech.kwik.agent15.engine.TlsClientEngineFactory
-import tech.kwik.agent15.engine.TlsMessageParser
-import tech.kwik.agent15.engine.TlsStatusEventHandler
-import tech.kwik.agent15.extension.Extension
-import tech.kwik.agent15.handshake.CertificateMessage
-import tech.kwik.agent15.handshake.CertificateVerifyMessage
-import tech.kwik.agent15.handshake.ClientHello
-import tech.kwik.agent15.handshake.FinishedMessage
 import java.io.BufferedInputStream
-import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.EOFException
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.Socket
-import java.nio.ByteBuffer
+import java.security.SecureRandom
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import javax.crypto.Cipher
-import javax.crypto.Mac
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import javax.net.ssl.SSLException
@@ -34,8 +18,8 @@ import javax.net.ssl.SSLHandshakeException
 import javax.net.ssl.X509TrustManager
 
 /**
- * TLS 1.3 over a plain TCP socket in pure Java: the handshake is Kwik's own engine (agent15, the one QUIC already uses on
- * every Android version), and this file is the TLS record layer around it (RFC 8446 section 5). The platform's TLS only
+ * TLS 1.3 over a plain TCP socket in pure Java: the handshake is our own state machine ([Tls13ClientHandshake], written
+ * from RFC 8446), and this file is the TLS record layer around it (RFC 8446 section 5). The platform's TLS only
  * speaks 1.3 from Android 10, and the edge's TCP endpoint requires 1.3, so this is what lets the HTTP/2 transport run on
  * Android 7 to 9.
  *
@@ -63,8 +47,7 @@ internal class Tls13Connection private constructor(private val socket: Socket) :
     /** The peer asked us to rotate our keys too. The reader must never wait for the write lock (see [onKeyUpdate]). */
     @Volatile private var keyUpdateReplyPending = false
 
-    private lateinit var engine: TlsClientEngine
-    private val parser = TlsMessageParser()
+    private lateinit var handshake: Tls13ClientHandshake
     private var handshakeBytes = ByteArray(0)
     @Volatile private var eof = false
     @Volatile private var closed = false
@@ -102,67 +85,49 @@ internal class Tls13Connection private constructor(private val socket: Socket) :
 
     // ── Handshake ────────────────────────────────────────────────────────────
 
-    private fun handshake(serverName: String, trust: X509TrustManager) {
-        val sender = object : ClientMessageSender {
-            override fun send(clientHello: ClientHello) = writeRecord(HANDSHAKE, clientHello.bytes, protect = false)
-            override fun send(finishedMessage: FinishedMessage) = writeRecord(HANDSHAKE, finishedMessage.bytes) // still under the handshake keys
-            override fun send(certificateMessage: CertificateMessage) = writeRecord(HANDSHAKE, certificateMessage.bytes)
-            override fun send(certificateVerifyMessage: CertificateVerifyMessage) = writeRecord(HANDSHAKE, certificateVerifyMessage.bytes)
-        }
-        val events = object : TlsStatusEventHandler {
-            override fun earlySecretsKnown() {}
-            override fun handshakeSecretsKnown() {
-                readEpoch = Epoch(engine.serverHandshakeTrafficSecret); writeEpoch = Epoch(engine.clientHandshakeTrafficSecret)
+    private fun handshake(serverName: String, trust: X509TrustManager, random: SecureRandom) {
+        val hs = Tls13ClientHandshake(serverName, trust, random)
+        handshake = hs
+        writeRecord(HANDSHAKE, hs.clientHello(), protect = false)
+        while (!hs.isComplete) {
+            val (type, content) = readRecord() ?: throw SSLHandshakeException("the server closed the connection during the handshake")
+            when (type) {
+                HANDSHAKE -> onHandshakeBytes(content)
+                ALERT -> throw SSLHandshakeException("TLS alert during the handshake: level ${content.getOrNull(0)}, description ${content.getOrNull(1)}")
+                CHANGE_CIPHER_SPEC -> {} // middlebox compatibility record: ignored
+                else -> throw SSLHandshakeException("unexpected record type $type during the handshake")
             }
-            override fun handshakeFinished() {
-                // The client Finished has already been written under the handshake keys (see TlsClientEngineImpl).
-                withWriteLock { writeEpoch = Epoch(engine.clientApplicationTrafficSecret) }
-                readEpoch = Epoch(engine.serverApplicationTrafficSecret)
-            }
-            override fun newSessionTicketReceived(ticket: NewSessionTicket) {}
-            override fun extensionsReceived(extensions: List<Extension>) {}
-            override fun isEarlyDataAccepted() = false
-        }
-        engine = TlsClientEngineFactory.createClientEngine(sender, events)
-        engine.setServerName(serverName)
-        engine.addSupportedCiphers(listOf(TlsConstants.CipherSuite.TLS_AES_128_GCM_SHA256))
-        engine.setTrustManager(trust)
-        engine.setCompatibilityMode(false)
-        try {
-            engine.startHandshake(
-                listOf(TlsConstants.NamedGroup.secp256r1),
-                listOf(TlsConstants.NamedGroup.secp256r1, TlsConstants.NamedGroup.secp384r1, TlsConstants.NamedGroup.secp521r1),
-                // The same list Kwik offers for QUIC, which is known to work on every Android version.
-                listOf(
-                    TlsConstants.SignatureScheme.rsa_pss_rsae_sha256, TlsConstants.SignatureScheme.rsa_pss_rsae_sha384, TlsConstants.SignatureScheme.rsa_pss_rsae_sha512,
-                    TlsConstants.SignatureScheme.ecdsa_secp256r1_sha256, TlsConstants.SignatureScheme.ecdsa_secp384r1_sha384, TlsConstants.SignatureScheme.ecdsa_secp521r1_sha512,
-                ),
-            )
-            while (!engine.handshakeFinished()) {
-                val (type, content) = readRecord() ?: throw SSLHandshakeException("the server closed the connection during the handshake")
-                when (type) {
-                    HANDSHAKE -> onHandshakeBytes(content, if (readEpoch == null) ProtectionKeysType.None else ProtectionKeysType.Handshake)
-                    ALERT -> throw alertException(content)
-                    CHANGE_CIPHER_SPEC -> {} // middlebox compatibility record: ignored
-                    else -> throw SSLHandshakeException("unexpected record type $type during the handshake")
-                }
-            }
-        } catch (e: TlsProtocolException) {
-            throw SSLHandshakeException("TLS 1.3 handshake failed: ${e.message}").also { it.initCause(e) }
         }
     }
 
     /** Handshake messages can span records and a record can hold several messages. */
-    private fun onHandshakeBytes(bytes: ByteArray, protection: ProtectionKeysType) {
+    private fun onHandshakeBytes(bytes: ByteArray) {
         handshakeBytes += bytes
         while (handshakeBytes.size >= 4) {
             val length = ((handshakeBytes[1].toInt() and 0xff) shl 16) or ((handshakeBytes[2].toInt() and 0xff) shl 8) or (handshakeBytes[3].toInt() and 0xff)
+            // No legitimate message is anywhere near this (a long certificate chain is a few KB): do not buffer what a hostile peer announces.
+            if (length > MAX_HANDSHAKE_MESSAGE) throw TlsHandshakeException(TlsAlert.DECODE_ERROR, "handshake message of $length bytes is too large")
             if (handshakeBytes.size < 4 + length) return
             val message = handshakeBytes.copyOfRange(0, 4 + length)
             handshakeBytes = handshakeBytes.copyOfRange(4 + length, handshakeBytes.size)
-            if (message[0].toInt() == KEY_UPDATE) { onKeyUpdate(message); continue }
-            val level = if (protection == ProtectionKeysType.None) protection else if (engine.handshakeFinished()) ProtectionKeysType.Application else ProtectionKeysType.Handshake
-            parser.parseAndProcessHandshakeMessage(ByteBuffer.wrap(message), engine, level)
+            if (handshake.isComplete) {
+                if (message[0].toInt() == KEY_UPDATE) onKeyUpdate(message) else handshake.onPostHandshake(message)
+                continue
+            }
+            val outgoing = handshake.receive(message, underHandshakeKeys = readEpoch != null)
+            // Key changes (RFC 8446 section 5.1): the message that changes keys must be the last thing in its record.
+            val secrets = handshake.handshakeSecrets
+            if (secrets != null && readEpoch == null) {
+                if (handshakeBytes.isNotEmpty()) throw TlsHandshakeException(TlsAlert.UNEXPECTED_MESSAGE, "data after the ServerHello in the same record")
+                readEpoch = Epoch(secrets.server); writeEpoch = Epoch(secrets.client)
+            }
+            for (o in outgoing) writeRecord(HANDSHAKE, o.bytes, protect = o.underHandshakeKeys) // our Finished still goes under the handshake keys
+            val app = handshake.applicationSecrets
+            if (handshake.isComplete && app != null) {
+                if (handshakeBytes.isNotEmpty()) throw TlsHandshakeException(TlsAlert.UNEXPECTED_MESSAGE, "data after the server Finished in the same record")
+                withWriteLock { writeEpoch = Epoch(app.client) }
+                readEpoch = Epoch(app.server)
+            }
         }
     }
 
@@ -176,9 +141,10 @@ internal class Tls13Connection private constructor(private val socket: Socket) :
      * to us, and we would not be reading either. The RFC only requires the reply "prior to sending its next Application Data".
      */
     private fun onKeyUpdate(message: ByteArray) {
+        if (message.size != 5 || (message[4].toInt() and 0xff) > 1) throw SSLException("malformed KeyUpdate")
         keyUpdatesSeen++
         readEpoch = readEpoch!!.next()
-        if (message.size >= 5 && message[4].toInt() == 1) keyUpdateReplyPending = true
+        if (message[4].toInt() == 1) keyUpdateReplyPending = true
     }
 
     private fun readApplicationData(): ByteArray? {
@@ -186,7 +152,7 @@ internal class Tls13Connection private constructor(private val socket: Socket) :
             val (type, content) = readRecord() ?: run { eof = true; return null }
             when (type) {
                 APPLICATION_DATA -> if (content.isNotEmpty()) return content
-                HANDSHAKE -> onHandshakeBytes(content, ProtectionKeysType.Application)
+                HANDSHAKE -> onHandshakeBytes(content)
                 ALERT -> {
                     val description = content.getOrNull(1)?.toInt() ?: -1
                     when (description) {
@@ -278,34 +244,24 @@ internal class Tls13Connection private constructor(private val socket: Socket) :
         private const val APPLICATION_DATA = 23
         private const val KEY_UPDATE = 24
         private const val MAX_FRAGMENT = 16_384
+        private const val MAX_HANDSHAKE_MESSAGE = 1 shl 17
 
-        /** Runs the TLS 1.3 handshake on an already connected [socket] (SNI [serverName], certificates checked by [trust]). */
-        fun connect(socket: Socket, serverName: String, trust: X509TrustManager, handshakeTimeoutMs: Int): Tls13Connection {
+        /** Runs the TLS 1.3 handshake on an already connected [socket] (SNI [serverName], certificates checked by [trust] and matched to the name). */
+        fun connect(socket: Socket, serverName: String, trust: X509TrustManager, handshakeTimeoutMs: Int, random: SecureRandom = SecureRandom()): Tls13Connection {
             EcParametersPolyfill.ensureInstalled()
             val c = Tls13Connection(socket)
-            val previous = Thread.currentThread().contextClassLoader
-            Thread.currentThread().contextClassLoader = TlsClientEngine::class.java.classLoader // agent15 finds its key exchange via ServiceLoader
             try {
                 socket.soTimeout = handshakeTimeoutMs
-                c.handshake(serverName, trust)
+                c.handshake(serverName, trust, random)
                 socket.soTimeout = 0
                 return c
             } catch (e: Exception) {
                 runCatching { socket.close() }
                 throw e
-            } finally {
-                Thread.currentThread().contextClassLoader = previous
             }
         }
 
-        /** HKDF-Expand-Label (RFC 8446 section 7.1) for outputs of at most one hash block (32 bytes with SHA-256). */
-        fun expandLabel(secret: ByteArray, label: String, context: ByteArray, length: Int): ByteArray {
-            require(length <= 32)
-            val full = "tls13 $label".toByteArray(Charsets.ISO_8859_1)
-            val info = ByteArrayOutputStream().apply { write(length ushr 8); write(length); write(full.size); write(full); write(context.size); write(context) }.toByteArray()
-            val mac = Mac.getInstance("HmacSHA256").apply { init(SecretKeySpec(secret, "HmacSHA256")) }
-            mac.update(info); mac.update(1)
-            return mac.doFinal().copyOf(length)
-        }
+        /** HKDF-Expand-Label (RFC 8446 section 7.1); the implementation lives in [Tls13Crypto]. */
+        fun expandLabel(secret: ByteArray, label: String, context: ByteArray, length: Int): ByteArray = Tls13Crypto.expandLabel(secret, label, context, length)
     }
 }

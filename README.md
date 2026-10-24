@@ -20,12 +20,12 @@ Working end to end: a request to the public URL reaches a server on the device a
 
 | Where | What was verified |
 |---|---|
-| JDK 17, macOS | Full flow over **both transports**, HA failover, reconnect, 20 MB download and 5 MB upload with identical checksums, WebSocket echo over HTTP/2 |
-| **Android 7.0 emulator (API 24, arm64)** | QUIC: full flow, 30/30 requests answered; mobile data off for 40 s and on again, both connections re-register within 1 s of the network returning. **With UDP 7844 dropped by iptables:** `AUTO` falls back to HTTP/2 over TCP with the pure-Java TLS 1.3, tunnel up in 4.7 s, 40/40 requests and 20 in parallel. `minSdk 24` with core library desugaring |
+| JDK 17, macOS | Full flow over **both transports**, HA failover, reconnect, 20 MB download and 5 MB upload with identical checksums, WebSocket echo over HTTP/2. The pure-Java TLS with our own handshake also against the real edge: up in 4.6 s, five 20 MB downloads and a 5 MB upload intact |
+| **Android 7.0 emulator (API 24, arm64)** | QUIC: full flow, 30/30 requests answered; mobile data off for 40 s and on again, both connections re-register within 1 s of the network returning. **With UDP 7844 dropped by iptables:** `AUTO` falls back to HTTP/2 over TCP with the pure-Java TLS 1.3, tunnel up in 4.7 s, 40/40 requests and 20 in parallel. `minSdk 24` with core library desugaring **Re-run with our own TLS (release + R8, UDP dropped):** up in 6.4 s over HTTP/2, 40/40 requests, 20 in parallel, 150 KB uploads |
 | Android 14 emulator (API 34, arm64) | Full flow; switching Wi-Fi off and on: ~4 s and ~2 s outages, both connections re-register on their own; R8-minified release build |
 | Samsung S24+ (Android 16) | Full flow with the app in the background (foreground service): tunnel up in 4.6 s, 30/30 requests answered, no reconnects needed |
 | Samsung S24+ (Android 16), HTTP/2 only | The **platform-TLS** path on a real device: tunnel up in 5.0 s over HTTP/2 alone, 40/40 requests and 20 in parallel |
-| **Android 7.0 emulator limited to 1 GB RAM, 2 cores** (heap growth limit 48 MB) | 3-minute tunnels with light traffic plus 150 KB uploads, 64/64 requests each. **QUIC:** peak RSS 101 MB (mostly shared system pages), own memory (PSS) at most 24 MB, Java heap at most 7.6 MB, native heap 5.3 MB, 35 threads, 4 s of CPU. **HTTP/2 + pure-Java TLS (UDP blocked):** PSS at most 23 MB, Java heap 6.7 MB, 30 threads, 2 s of CPU. No low-memory kills. The host CPU is much faster than a TV box, so read the CPU figure as a floor |
+| **Android 7.0 emulator limited to 1 GB RAM, 2 cores** (heap growth limit 48 MB) | 3-minute tunnels: a GET every 2 s plus a 150 KB upload every ~16 s, all answered (64 GET + 8 uploads each). **QUIC:** peak RSS 101 MB (mostly shared system pages), own memory (PSS) at most 24 MB, Java heap at most 7 MB, native heap 5 MB, 35 threads, 4 s of CPU. **HTTP/2 + our own TLS (UDP blocked):** PSS at most 22.5 MB, Java heap 5.9 MB, 30 threads, 4 s of CPU (5 s with the previous TLS). Two earlier runs of the HTTP/2 case read 18 and 21 s of CPU while the Mac was busy compiling and could not be reproduced on a quiet machine. No low-memory kills. The host CPU is much faster than a TV box, so read the CPU figure as a floor |
 | Limits | `maxRequests` and `maxLifetimeMs` close the tunnel against the real edge (the next request gets 530), and are covered by unit tests, including closing from inside the callback |
 
 ## Limitations
@@ -38,7 +38,7 @@ Working end to end: a request to the public URL reaches a server on the device a
 - No UDP/ICMP proxying (`datagram` v2/v3).
 
 Not verified: Android 8 to 13 and real devices below Android 14 (only 7.0 (emulator), 14 (emulator) and 16 (device) were run; the platform-TLS path ran on a JDK and on Android 16 only; the polyfill and desugaring paths are the same for 8 to 13), a network that *silently drops* UDP 7844 (the tests used a sandbox and iptables, which refuse immediately; a silent drop takes the 4 s handshake timeout per QUIC edge instead, which unit tests cover), IPv6-only networks, long runs (hours), doze mode.
-159 unit tests run without network access (`./gradlew :quick-tunnel:test`).
+239 unit tests run without network access (`./gradlew :quick-tunnel:test`).
 
 ## What it does
 
@@ -71,9 +71,12 @@ force one of them. `handle.transports` tells which one each connection is using.
 
 **TLS for the TCP transport.** The edge's TCP endpoint only accepts TLS 1.3, which the platform gained in Android 10. So
 `TcpTls.AUTO` uses the platform's TLS where it speaks 1.3 (Android 10+, any current JDK) and otherwise a pure-Java TLS 1.3
-client (`Tls13.kt`): Kwik's own handshake engine, the one QUIC already runs on every Android version, plus a TLS record
-layer written for this library (AES-128-GCM, key updates, close_notify). It is checked against the JDK's TLS server and
-against the real edge, and it is what makes the TCP fallback work on Android 7 to 9. `PURE_JAVA` forces it anywhere.
+client of our own (`Tls13.kt`, `TlsHandshake.kt`, `TlsVerify.kt`): a handshake state machine written from RFC 8446 and checked
+against the RFC 8448 traces, plus a TLS record layer (AES-128-GCM, key updates, close_notify). It verifies the certificate chain
+through the trust manager, **and** the server name (the Cloudflare Origin CA issues certificates to any customer, so a valid
+chain alone proves nothing), the CertificateVerify signature and the Finished MAC. It is checked against the JDK's TLS server and
+against the real edge, and it is what makes the TCP fallback work on Android 7 to 9. `PURE_JAVA` forces it anywhere. It does
+not use Kwik or agent15.
 
 The HTTP/2 transport is a small server written for this library (`Http2.kt`): SETTINGS, HEADERS/CONTINUATION, DATA,
 flow control in both directions, PING, RST_STREAM, GOAWAY. HPACK decoding uses `com.twitter:hpack`.
@@ -109,7 +112,7 @@ See [`sample-android`](sample-android) for a working foreground service. What it
 - **Keep it in a foreground service.** The process is otherwise killed in the background.
 - **Call `handle.reconnectNow()` when the default network changes** (`ConnectivityManager.registerDefaultNetworkCallback`).
   The QUIC sockets are bound to the old interface and would otherwise wait for the idle timeout (15 s).
-- **Android 7 to 13 lack `AlgorithmParameters.getInstance("EC")`**, which Kwik's TLS uses for every handshake. The library installs a
+- **Android 7 to 13 lack `AlgorithmParameters.getInstance("EC")`**, which Kwik's TLS (and our own TLS, for the curve parameters) uses for every handshake. The library installs a
   tiny JCA provider with the three NIST curves when the platform does not have it (`EcParametersPolyfill`, checked against the
   JDK's values by a unit test). Without it, QUIC fails on those versions with "Missing support for EC algorithm".
 - **The TCP fallback runs on Android 7+ too.** The platform's TLS has no 1.3 before Android 10, and the edge's TCP endpoint
@@ -146,9 +149,19 @@ Everything the library talks to, for allowlists and firewalls:
   dnsjava use `java.time`, which Android 7 lacks. Without it the tunnel fails on Android 7 with
   `NoClassDefFoundError: java.time.Duration` (checked on the API 24 emulator; the failure is in the DNS step, before any Kwik
   code, so removing Kwik alone would not remove the need). Android 8+ needs nothing extra.
-- **Size added to a release APK after R8, dex only (there is no native code):** about **496 KB** of `classes.dex` without
-  desugaring and about **688 KB** with it (the `j$.*` classes add ~190 KB). Measured on the sample app: an empty app is
-  1 KB of dex; the sample release APK is 254 KB without and 341 KB with desugaring. The figures include the sample's own few KB.
+- **Size added to a release APK after R8, dex only (there is no native code).** Measured on the sample app against an empty app
+  (1 KB of dex); the figures include the sample's own few KB:
+
+  | | `classes.dex` | sample release APK |
+  |---|---|---|
+  | With QUIC (Kwik + agent15 in the build), no desugaring | 523 KB | 268 KB |
+  | With QUIC, with desugaring (needed below Android 8) | 720 KB | 357 KB |
+  | **HTTP/2 only, no Kwik/agent15**, no desugaring | **340 KB** | **178 KB** |
+  | **HTTP/2 only, no Kwik/agent15**, with desugaring | **529 KB** | **264 KB** |
+
+  The "HTTP/2 only" rows come from a scratch build with the QUIC code and Kwik removed; that configuration is **not shipped as a
+  build option yet** (see [Credits and licenses](#credits-and-licenses)). Desugaring adds ~190 KB of `j$.*` classes, and here it is
+  mostly dnsjava's `java.time` use that needs it.
 - R8 rules: `sample-android/proguard-rules.pro` (`-dontwarn` for classes dnsjava and Kotlin serialization reference but never use).
 
 ## Repository layout
@@ -176,6 +189,8 @@ implementation of the same idea, and the protocol comes from Cloudflare's open-s
 
 This project is dual-licensed under **MIT OR Apache-2.0** ([`LICENSE-MIT`](LICENSE-MIT), [`LICENSE-APACHE`](LICENSE-APACHE)).
 
-**Heads up: Kwik and its TLS stack agent15 are LGPL-3.0.** This library only depends on them (it does not copy their
-code), which is fine for publishing. If you ship an application that bundles them, for example one Android APK, the
-LGPL obligations apply to that distribution. See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+**Heads up: Kwik and its TLS stack agent15 are LGPL-3.0.** They are used by the QUIC transport only. This library only depends on
+them (it does not copy their code), which is fine for publishing. If you ship an application that bundles them, for example one
+Android APK, the LGPL obligations apply to that distribution. The TCP/HTTP/2 transport, including its TLS 1.3, does not use
+them, so a build without QUIC has no LGPL code; that configuration is not offered as a build option yet. See
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

@@ -14,7 +14,7 @@
 | Dependency | License |
 |---|---|
 | [Kwik](https://github.com/ptrd/kwik) `tech.kwik:kwik` | **LGPL-3.0** |
-| [agent15](https://github.com/ptrd/kwik) `tech.kwik:agent15` (Kwik's TLS 1.3; also used directly for the TCP transport) | **LGPL-3.0** |
+| [agent15](https://github.com/ptrd/kwik) `tech.kwik:agent15` (Kwik's TLS 1.3; brought in by Kwik for QUIC only: the TCP transport has its own TLS and does not use it) | **LGPL-3.0** |
 | [dnsjava](https://github.com/dnsjava/dnsjava) | BSD-3-Clause |
 | [twitter/hpack](https://github.com/twitter/hpack) (HPACK decoder for the HTTP/2 transport) | Apache-2.0 |
 | [kotlinx.serialization](https://github.com/Kotlin/kotlinx.serialization) | Apache-2.0 |

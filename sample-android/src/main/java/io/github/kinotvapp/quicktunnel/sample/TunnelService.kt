@@ -79,9 +79,20 @@ class TunnelService : Service() {
                 val c = try { s.accept() } catch (_: Exception) { return@thread }
                 thread(isDaemon = true) {
                     c.use {
-                        val r = it.getInputStream().bufferedReader()
+                        val r = it.getInputStream().bufferedReader(Charsets.ISO_8859_1)
                         val first = r.readLine() ?: return@thread
-                        while (r.readLine().orEmpty().isNotEmpty()) { /* drain headers */ }
+                        var length = 0; var chunked = false
+                        while (true) {
+                            val h = r.readLine().orEmpty()
+                            if (h.isEmpty()) break
+                            if (h.startsWith("content-length:", true)) length = h.substringAfter(':').trim().toIntOrNull() ?: 0
+                            if (h.startsWith("transfer-encoding:", true) && h.contains("chunked", true)) chunked = true
+                        }
+                        // Read the whole request body before answering: closing a socket with unread data resets it, and the
+                        // proxy would then report a 502 for a perfectly good upload.
+                        if (chunked) {
+                            while (true) { val n = r.readLine()?.substringBefore(';')?.trim()?.toIntOrNull(16) ?: break; if (n == 0) { r.readLine(); break }; var left = n; while (left > 0) { val k = r.skip(left.toLong()).toInt(); if (k <= 0) break; left -= k }; r.readLine() }
+                        } else { var left = length.toLong(); while (left > 0) { val k = r.skip(left); if (k <= 0) break; left -= k } }
                         val body = "hello from ART ${android.os.Build.MODEL} api${android.os.Build.VERSION.SDK_INT} $first\n".toByteArray()
                         it.getOutputStream().apply { write("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ${body.size}\r\nConnection: close\r\n\r\n".toByteArray()); write(body); flush() }
                     }

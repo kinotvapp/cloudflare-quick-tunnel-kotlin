@@ -77,9 +77,17 @@ Same port, different wire. Mirrors `connection/http2.go` and `connection/header.
 
 ### TLS 1.3 record layer notes (Tls13.kt)
 
-- Handshake messages are parsed and driven by agent15 (`TlsMessageParser`, `TlsClientEngine`); we supply the records. Order of
-  events at the end of the handshake: the engine calls `send(Finished)` (still under the handshake keys), then computes the
-  application secrets, then `handshakeFinished()`: switch both directions to application keys there, not before.
+- The handshake is our own state machine (`TlsHandshake.kt`, written from RFC 8446, no I/O): the record layer feeds it complete
+  handshake messages and installs the traffic secrets it exposes. Order at the end: the server Finished verifies, the machine
+  returns our Finished (send it under the HANDSHAKE keys), and only then are both directions switched to the application keys.
+  A message that changes keys (ServerHello, server Finished) must end its record, and handshake messages over 128 KiB are refused.
+- What is verified: the chain through the trust manager, then the leaf's subjectAltName against the SNI name (RFC 6125 section
+  6.4: a wildcard only as the whole left-most label, one label, never the CN), then CertificateVerify over the section 4.4.3
+  content with a scheme we offered that matches the key, then the server Finished in constant time. The name check is not
+  optional: Cloudflare's Origin CA issues certificates to any Cloudflare customer for their own domains, so a chain that
+  validates says nothing about whose server answered. HelloRetryRequest is handled (new share, cookie echo, `message_hash`
+  transcript); a second one, an unoffered cipher or group, an unsolicited extension or a CertificateRequest abort the handshake.
+- `X509TrustManager.checkServerTrusted` wants a key-exchange name as `authType` (`ECDHE_ECDSA`, `ECDHE_RSA`), not a key type: with `ECDSA` the JDK throws "Unknown authType" on any chain issued by a CA. A self-signed leaf skips that check, so only a test with a real CA-issued chain (`TlsCaChainTest`) or the real edge shows it.
 - Record protection: AES-128-GCM, nonce = write IV xor the 64-bit sequence number, AAD = the 5-byte record header, inner
   plaintext = content + content type (+ optional zero padding). Sequence numbers reset on every key change.
 - `KeyUpdate` (type 24): rotate the read keys as soon as it arrives. If `update_requested`, answer **on the next write**, not

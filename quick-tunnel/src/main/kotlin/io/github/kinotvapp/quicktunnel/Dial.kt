@@ -67,7 +67,7 @@ enum class TcpTls {
     /** The platform's TLS when it speaks 1.3 (Android 10+, any current JDK), otherwise the pure-Java one below. */
     AUTO,
     PLATFORM,
-    /** Kwik's TLS 1.3 engine with our record layer ([Tls13Connection]). Works on every Android version. */
+    /** Our own TLS 1.3 handshake and record layer ([Tls13Connection]). Works on every Android version. */
     PURE_JAVA,
 }
 
