@@ -9,7 +9,7 @@ android {
     defaultConfig { applicationId = "io.github.kinotvapp.quicktunnel.sample"; minSdk = 24; targetSdk = 34; versionCode = 1; versionName = "0.1.0" }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17
-        isCoreLibraryDesugaringEnabled = desugar // java.time (Kwik, the library) does not exist on Android 7
+        isCoreLibraryDesugaringEnabled = desugar // java.time (dnsjava) does not exist on Android 7
     }
     kotlinOptions { jvmTarget = "17" }
     buildTypes { release { isMinifyEnabled = true; proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro") } }

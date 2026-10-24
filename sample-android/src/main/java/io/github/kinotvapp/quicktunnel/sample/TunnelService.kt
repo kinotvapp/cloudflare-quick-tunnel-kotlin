@@ -12,7 +12,6 @@ import android.os.IBinder
 import android.util.Log
 import io.github.kinotvapp.quicktunnel.QuickTunnelHandle
 import io.github.kinotvapp.quicktunnel.QuickTunnelManager
-import io.github.kinotvapp.quicktunnel.TransportPolicy
 import io.github.kinotvapp.quicktunnel.platformTlsSupports13
 import io.github.kinotvapp.quicktunnel.TunnelListener
 import java.net.InetAddress
@@ -40,9 +39,7 @@ class TunnelService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == "stop") { stop(); return START_NOT_STICKY }
         if (handle != null || server != null) return START_STICKY
-        // `adb shell am start -n .../.MainActivity --es policy http2` forces one transport (default: AUTO).
-        val policy = when (intent?.getStringExtra("policy")) { "http2" -> TransportPolicy.HTTP2_ONLY; "quic" -> TransportPolicy.QUIC_ONLY; else -> TransportPolicy.AUTO }
-        Log.i(TAG, "policy=$policy, platform TLS speaks 1.3: ${platformTlsSupports13()}")
+        Log.i(TAG, "platform TLS speaks 1.3: ${platformTlsSupports13()}")
         val builder = if (Build.VERSION.SDK_INT >= 26) {
             getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel("qt", "Tunnel", NotificationManager.IMPORTANCE_LOW))
             Notification.Builder(this, "qt")
@@ -55,10 +52,8 @@ class TunnelService : Service() {
         thread(name = "qt-start") {
             try {
                 val t0 = System.currentTimeMillis()
-                handle = QuickTunnelManager(PORT, transport = policy, listener = object : TunnelListener {
+                handle = QuickTunnelManager(PORT, listener = object : TunnelListener {
                     override fun onRegistered(connIndex: Int, location: String) { Log.i(TAG, "registered conn=$connIndex location=$location") }
-                    override fun onTransport(connIndex: Int, transport: io.github.kinotvapp.quicktunnel.Transport) { Log.i(TAG, "conn=$connIndex transport=$transport") }
-                    override fun onTransportFallback(connIndex: Int, reason: String) { Log.w(TAG, "QUIC unavailable, using HTTP/2 over TCP: $reason") }
                     override fun onLimitReached(limit: io.github.kinotvapp.quicktunnel.TunnelLimit) { Log.i(TAG, "limit reached: $limit") }
                     override fun onLost(connIndex: Int, reason: String) { Log.w(TAG, "LOST conn=$connIndex ($reason)") }
                     override fun onReconnecting(connIndex: Int, attempt: Int, delayMs: Long) { Log.i(TAG, "reconnecting conn=$connIndex attempt=$attempt in ${delayMs}ms") }

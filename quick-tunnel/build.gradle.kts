@@ -6,8 +6,6 @@ group = "io.github.kinotvapp"
 version = "0.1.0"
 
 dependencies {
-    // Kwik (QUIC + TLS 1.3 in pure Java) is LGPL-3.0: see THIRD_PARTY_NOTICES.md.
-    api("tech.kwik:kwik:0.12.1")
     implementation("dnsjava:dnsjava:3.6.2")
     implementation("com.twitter:hpack:1.0.2") // HPACK decoding (Huffman + dynamic table) for the HTTP/2 fallback
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
@@ -20,7 +18,7 @@ kotlin {
     jvmToolchain(17)
     compilerOptions {
         jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_11)
-        // Fail the build on JDK APIs Android lacks (e.g. ByteBuffer.get(int, byte[]) is Java 13+); Kwik itself needs 11.
+        // Fail the build on JDK APIs Android lacks (e.g. ByteBuffer.get(int, byte[]) is Java 13+).
         freeCompilerArgs.add("-Xjdk-release=11")
     }
 }
@@ -37,3 +35,13 @@ tasks.test {
     jvmArgs("-Djava.security.properties=${tlsTestProps.absolutePath}")
     if (project.hasProperty("tlsDebug")) { jvmArgs("-Djavax.net.debug=ssl:handshake"); testLogging { showStandardStreams = true } }
 }
+
+// The library ships no LGPL code: fail the build if a copyleft QUIC/TLS stack ever sneaks back into the runtime classpath.
+val verifyNoLgpl by tasks.registering {
+    val artifacts = configurations.runtimeClasspath.map { cfg -> cfg.incoming.artifactView { }.artifacts.map { it.id.componentIdentifier.displayName } }
+    doLast {
+        val banned = artifacts.get().filter { it.startsWith("tech.kwik") || "agent15" in it }
+        check(banned.isEmpty()) { "LGPL dependencies on the runtime classpath: $banned" }
+    }
+}
+tasks.check { dependsOn(verifyNoLgpl) }

@@ -6,41 +6,31 @@ import java.net.ServerSocket
 import java.net.Socket
 import kotlin.concurrent.thread
 
-/** Builds what the edge writes on a request stream: signature + version + capnp ConnectRequest. */
-fun connectRequestBytes(dest: String, type: Int, metadata: List<Pair<String, String>>): ByteArray {
-    val frame = CapnpBuilder().apply {
-        val root = root(1, 2)
-        text(root + 1, dest); u16(root, 0, type)
-        val list = structList(root + 2, metadata.size, 0, 2)
-        metadata.forEachIndexed { n, (k, v) -> text(list + n * 2, k); text(list + n * 2 + 1, v) }
-    }.frame()
-    return DATA_SIG + "01".toByteArray() + frame
-}
-
+/** A request as the edge would describe it: method, host and headers in the metadata. */
 fun httpRequestMeta(method: String, host: String, vararg headers: Pair<String, String>) =
     listOf(HTTP_METHOD_KEY to method, HTTP_HOST_KEY to host) + headers.map { "$HTTP_HEADER:${it.first}" to it.second }
 
-class EdgeResponse(val error: String, val metadata: List<Pair<String, String>>, val body: ByteArray) {
-    val status get() = metadata.first { it.first == HTTP_STATUS_KEY }.second.toInt()
-    fun header(name: String) = metadata.firstOrNull { it.first.equals("$HTTP_HEADER:$name", true) }?.second
+class EdgeResponse(val status: Int, val headers: List<Pair<String, String>>, val error: String, val body: ByteArray) {
+    fun header(name: String) = headers.firstOrNull { it.first.equals(name, true) }?.second
 }
 
-/** Parses what we write back to the edge: preamble + ConnectResponse + raw body. */
-fun parseEdgeResponse(bytes: ByteArray): EdgeResponse {
-    val inp = ByteArrayInputStream(bytes)
-    val sig = ByteArray(6).also { inp.readFully(it) }
-    check(sig.contentEquals(DATA_SIG)) { "bad signature" }
-    ByteArray(2).also { inp.readFully(it) }
-    val root = CapnpMessage.read(inp).root()!!
-    val meta = root.structList(1).map { (it.text(0) ?: "") to (it.text(1) ?: "") }
-    return EdgeResponse(root.text(0) ?: "", meta, inp.readBytes())
+/** Captures what the proxy would put on the wire, whatever the transport. */
+class RecordingSink : ResponseSink {
+    private var status = 0
+    private var headers: List<Pair<String, String>> = emptyList()
+    private var error = ""
+    override val body = ByteArrayOutputStream()
+    override fun head(status: Int, headers: List<Pair<String, String>>) { this.status = status; this.headers = headers }
+    override fun error(status: Int, message: String) { this.status = status; error = message }
+    override fun finish() {}
+    fun response() = EdgeResponse(status, headers, error, body.toByteArray())
 }
 
-/** Runs one request through proxyConnection exactly as a QUIC stream would. */
-fun runProxy(request: ByteArray, port: Int, pool: LocalPool, metrics: TunnelMetrics = TunnelMetrics()): EdgeResponse {
-    val out = ByteArrayOutputStream()
-    proxyConnection(ByteArrayInputStream(request), out, port, pool, metrics)
-    return parseEdgeResponse(out.toByteArray())
+/** Runs one request through [serve] + [proxyHttp] exactly as the HTTP/2 router does. [edgeBody] is what the edge sends after the head. */
+fun runProxy(req: ConnectReq, @Suppress("UNUSED_PARAMETER") port: Int, pool: LocalPool, metrics: TunnelMetrics = TunnelMetrics(), edgeBody: ByteArray = ByteArray(0)): EdgeResponse {
+    val sink = RecordingSink()
+    serve(sink, metrics) { started -> proxyHttp(ByteArrayInputStream(edgeBody), sink, req, pool, metrics, started) }
+    return sink.response()
 }
 
 /** A tiny HTTP/1.1 origin: each accepted socket serves requests with [handler] until it closes. */

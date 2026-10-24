@@ -23,7 +23,7 @@ class ConfigTest {
     }
 
     @Test fun `only network class failures are transient`() {
-        assertTrue(TunnelException.Api("x").transient); assertTrue(TunnelException.Discovery("x").transient); assertTrue(TunnelException.QuicDial(1, "x").transient)
+        assertTrue(TunnelException.Api("x").transient); assertTrue(TunnelException.Discovery("x").transient); assertTrue(TunnelException.EdgeDial(1, "x").transient)
         assertTrue(TunnelException.ApiNonJson(503, "").transient); assertFalse(TunnelException.ApiNonJson(429, "").transient)
         assertFalse(TunnelException.ApiBusiness(emptyList()).transient); assertFalse(TunnelException.Register("x").transient)
     }

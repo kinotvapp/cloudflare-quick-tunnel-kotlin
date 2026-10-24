@@ -20,40 +20,14 @@ const val MAX_EDGES_PER_CYCLE = 5
 const val DEFAULT_FIRST_CONNECT_TIMEOUT_MS = 30_000L
 const val UNREGISTER_GRACE_S = 5L
 
-/** In AUTO, QUIC gets a short try (2 edges, 4 s each) so a network that drops UDP falls back quickly. */
-const val AUTO_QUIC_EDGES = 2
-const val AUTO_QUIC_HANDSHAKE_S = 4L
-
-/** After QUIC failed and HTTP/2 worked, go straight to HTTP/2 for this long before trying QUIC again. */
-const val PREFER_HTTP2_MS = 10 * 60_000L
 const val H2_CONTROL_WAIT_S = 10L
 const val H2_DRAIN_MS = 30_000L
 
 /** Mirror of the Rust curve: 1s, 2s, 4s, 8s, 16s, then 30s. */
 fun backoffMillis(attempt: Int): Long = (1L shl (attempt - 1).coerceIn(0, 5)).coerceAtMost(30) * 1000
 
-enum class Transport { QUIC, HTTP2 }
-
-enum class TransportPolicy {
-    /** QUIC (UDP 7844) first, HTTP/2 over TCP 7844 when QUIC cannot connect. */
-    AUTO,
-    QUIC_ONLY,
-    HTTP2_ONLY,
-}
-
-/** The order in which transports are tried for one connection cycle. */
-internal fun transportOrder(policy: TransportPolicy, preferHttp2: Boolean): List<Transport> = when (policy) {
-    TransportPolicy.QUIC_ONLY -> listOf(Transport.QUIC)
-    TransportPolicy.HTTP2_ONLY -> listOf(Transport.HTTP2)
-    TransportPolicy.AUTO -> if (preferHttp2) listOf(Transport.HTTP2, Transport.QUIC) else listOf(Transport.QUIC, Transport.HTTP2)
-}
-
 interface TunnelListener {
     fun onRegistered(connIndex: Int, location: String) {}
-    /** Which transport the connection registered over (called right after [onRegistered]). */
-    fun onTransport(connIndex: Int, transport: Transport) {}
-    /** QUIC could not connect and HTTP/2 over TCP took over. [reason] is the last QUIC error. */
-    fun onTransportFallback(connIndex: Int, reason: String) {}
     fun onLost(connIndex: Int, reason: String) {}
     fun onReconnecting(connIndex: Int, attempt: Int, delayMs: Long) {}
     fun onReconnectFailed(connIndex: Int, attempt: Int, error: TunnelException) {}
@@ -64,9 +38,8 @@ interface TunnelListener {
 
 enum class TunnelLimit { LIFETIME, REQUESTS }
 
-/** One registered connection to the edge, over either transport. */
+/** One registered connection to the edge. */
 internal class Link(
-    val transport: Transport,
     val control: ControlSession,
     val location: String,
     private val closeNow: () -> Unit,
@@ -88,9 +61,6 @@ class QuickTunnelHandle internal constructor(
 ) : AutoCloseable {
     val metrics get() = runtime.metrics
 
-    /** Transport each connection index is currently registered over. */
-    val transports: Map<Int, Transport> get() = runtime.transports()
-
     /**
      * Call when the device network changes or comes back. Closes every connection so each one reconnects, and cuts short
      * any reconnect backoff in progress: after being offline for a minute the next retry would otherwise be up to 30 s away.
@@ -109,8 +79,7 @@ class QuickTunnelHandle internal constructor(
         val config: QuickTunnelManager,
         val tunnel: QuickTunnel,
         val registry: EdgeRegistry,
-        dialOverrides: Map<Transport, EdgeDialer> = emptyMap(),
-        private val now: () -> Long = System::currentTimeMillis,
+        dialer: EdgeDialer? = null,
         private val h2ControlWaitS: Long = H2_CONTROL_WAIT_S,
     ) {
         val metrics = TunnelMetrics()
@@ -120,10 +89,7 @@ class QuickTunnelHandle internal constructor(
         private val links = ConcurrentHashMap<Int, Link>()
         private val reactors = CopyOnWriteArrayList<Thread>()
         private val streamPool = Executors.newCachedThreadPool { r -> Thread(r, "cfqt-stream").apply { isDaemon = true } }
-        @Volatile private var preferHttp2Until = 0L
-        private val dialers: Map<Transport, EdgeDialer> = mapOf(Transport.QUIC to ::dialQuicLink, Transport.HTTP2 to ::dialHttp2Link) + dialOverrides
-
-        fun transports(): Map<Int, Transport> = links.mapValues { it.value.transport }
+        private val dial: EdgeDialer = dialer ?: ::dialLink
 
         private val kickLock = ReentrantLock()
         private val kicked = kickLock.newCondition()
@@ -148,53 +114,25 @@ class QuickTunnelHandle internal constructor(
             if (stopped.get()) Wake.STOPPED else Wake.ELAPSED
         }
 
-        /** discover -> dial (QUIC, then HTTP/2 per policy) -> register. */
+        /** discover -> dial (TLS 1.3 over TCP) -> register. */
         fun connectCycle(connIndex: Int, replaceExisting: Boolean): Link {
             val edges = registry.get(config.ipVersion)
-            val order = transportOrder(config.transport, preferHttp2 = now() < preferHttp2Until)
             val errors = LinkedHashSet<String>() // one entry per distinct failure, so the first cause is not hidden by the last
-            var quicError: String? = null
-            for (transport in order) {
-                val tryEdges = if (transport == Transport.QUIC && order.size > 1) edges.take(AUTO_QUIC_EDGES) else edges.take(MAX_EDGES_PER_CYCLE)
-                for (edge in tryEdges) {
-                    if (stopped.get()) throw TunnelException.Shutdown()
-                    try {
-                        val link = dialers.getValue(transport)(edge, connIndex, replaceExisting)
-                        if (transport == Transport.HTTP2 && quicError != null) {
-                            preferHttp2Until = now() + PREFER_HTTP2_MS
-                            config.listener.onTransportFallback(connIndex, quicError)
-                        }
-                        return link
-                    } catch (e: TunnelException.Register) {
-                        throw e // the edge refused us: another address or transport will not change that
-                    } catch (e: Exception) {
-                        val reason = "$transport $edge: ${e.javaClass.simpleName}: ${e.message}"
-                        errors += reason
-                        if (transport == Transport.QUIC) quicError = reason
-                    }
+            for (edge in edges.take(MAX_EDGES_PER_CYCLE)) {
+                if (stopped.get()) throw TunnelException.Shutdown()
+                try {
+                    return dial(edge, connIndex, replaceExisting)
+                } catch (e: TunnelException.Register) {
+                    throw e // the edge refused us: another address will not change that
+                } catch (e: Exception) {
+                    errors += "$edge: ${e.javaClass.simpleName}: ${e.message}"
                 }
             }
             registry.invalidate() // every cached edge failed: the pool may have changed
-            throw TunnelException.QuicDial(edges.size, errors.take(6).joinToString(" | ").ifEmpty { "no edges" })
+            throw TunnelException.EdgeDial(edges.size, errors.take(6).joinToString(" | ").ifEmpty { "no edges" })
         }
 
-        private fun dialQuicLink(edge: EdgeAddr, connIndex: Int, replace: Boolean): Link {
-            val handshakeS = if (config.transport == TransportPolicy.AUTO) AUTO_QUIC_HANDSHAKE_S else HANDSHAKE_TIMEOUT_S
-            val conn = dial(edge, { s -> streamPool.execute { proxyStream(s, config.localPort, pool, metrics) } }, handshakeS)
-            var link: Link? = null
-            try {
-                val control = ControlSession(conn.createStream(true)) { e -> link?.lost?.complete("control stream ended: ${e.message}") }
-                val details = control.register(tunnel.accountTag, tunnel.secret, tunnel.id, connIndex, CLIENT_VERSION, replace)
-                link = Link(Transport.QUIC, control, details.location, { runCatching { conn.close() } }, { runCatching { conn.closeAndWait(Duration.ofSeconds(UNREGISTER_GRACE_S)) } })
-                conn.setConnectionListener { link.lost.complete("QUIC connection closed") }
-                return link
-            } catch (e: Exception) {
-                runCatching { conn.close() }
-                throw e
-            }
-        }
-
-        private fun dialHttp2Link(edge: EdgeAddr, connIndex: Int, replace: Boolean): Link {
+        private fun dialLink(edge: EdgeAddr, connIndex: Int, replace: Boolean): Link {
             val connection = dialTcp(edge, tls = config.tcpTls)
             return h2LinkOver(connection.input, connection.output, connIndex, replace) { runCatching { connection.close() } }
         }
@@ -222,7 +160,7 @@ class QuickTunnelHandle internal constructor(
                 val control = ControlSession(controlReq.body, controlReq.response.body) { e -> link?.lost?.complete("control stream ended: ${e.message}") }
                 val details = control.register(tunnel.accountTag, tunnel.secret, tunnel.id, connIndex, CLIENT_VERSION, replace)
                 link = Link(
-                    Transport.HTTP2, control, details.location,
+                    control, details.location,
                     closeNow = { ctx.release.complete(Unit); connection.close(0) },
                     // Requests already running finish before the socket goes away, like cloudflared's activeRequestsWG.Wait().
                     closeDraining = { ctx.release.complete(Unit); connection.close(H2_DRAIN_MS) },
@@ -240,7 +178,6 @@ class QuickTunnelHandle internal constructor(
 
         private fun announce(connIndex: Int, link: Link) {
             config.listener.onRegistered(connIndex, link.location)
-            config.listener.onTransport(connIndex, link.transport)
         }
 
         private fun reactor(connIndex: Int, initial: Link?, firstTryImmediately: Boolean) {
@@ -326,7 +263,7 @@ class QuickTunnelHandle internal constructor(
 
 /**
  * Entry point. All options have the Rust crate's defaults except [maxReconnectAttempts] (the crate gives up after 10, but
- * a phone that was offline for a few minutes should come back on its own) and [transport] (the crate has no HTTP/2).
+ * a phone that was offline for a few minutes should come back on its own).
  */
 class QuickTunnelManager(
     val localPort: Int,
@@ -336,8 +273,7 @@ class QuickTunnelManager(
     /** Bounds the first connect cycle (discovery + dial + register); later reconnects are not bounded. */
     val firstConnectTimeoutMs: Long = DEFAULT_FIRST_CONNECT_TIMEOUT_MS,
     val ipVersion: IpVersionFilter = IpVersionFilter.AUTO,
-    val transport: TransportPolicy = TransportPolicy.AUTO,
-    /** Which TLS carries the TCP transport; the default picks the platform's when it can do TLS 1.3. */
+    /** Which TLS carries the connection; the default picks the platform's when it can do TLS 1.3. */
     val tcpTls: TcpTls = TcpTls.AUTO,
     val listener: TunnelListener = object : TunnelListener {},
     val maxReconnectAttempts: Int = Int.MAX_VALUE,
@@ -360,7 +296,7 @@ class QuickTunnelManager(
         val first = try {
             result.get(firstConnectTimeoutMs, TimeUnit.MILLISECONDS)
         } catch (e: TimeoutException) {
-            rt.shutdown(); throw TunnelException.QuicDial(1, "first connect cycle timed out after ${firstConnectTimeoutMs}ms")
+            rt.shutdown(); throw TunnelException.EdgeDial(1, "first connect cycle timed out after ${firstConnectTimeoutMs}ms")
         } catch (e: java.util.concurrent.ExecutionException) {
             rt.shutdown(); throw (e.cause as? TunnelException ?: TunnelException.Internal(e.cause.toString(), e.cause))
         }

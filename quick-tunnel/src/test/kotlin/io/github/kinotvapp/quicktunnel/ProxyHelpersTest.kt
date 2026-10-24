@@ -19,7 +19,7 @@ class ProxyHelpersTest {
         assertEquals("/", extractPath("garbage"))
     }
 
-    private fun req(vararg h: Pair<String, String>) = ConnectReq("https://x/", 0, httpRequestMeta("GET", "x", *h))
+    private fun req(vararg h: Pair<String, String>) = ConnectReq("https://x/", httpRequestMeta("GET", "x", *h))
 
     @Test fun `request shape decides poolability`() {
         assertTrue(analyseRequest(req()).poolable)
@@ -91,21 +91,6 @@ class ProxyHelpersTest {
         copyN(ByteArrayInputStream(ByteArray(100) { it.toByte() }), out, 40, c)
         assertEquals(40, out.size()); assertEquals(40, c.get())
         assertFailsWith<EOFException> { copyN(ByteArrayInputStream(ByteArray(3)), java.io.ByteArrayOutputStream(), 10, c) }
-    }
-
-    @Test fun `ConnectRequest and ConnectResponse survive a round trip`() {
-        val bytes = connectRequestBytes("https://a/b", 1, listOf("k1" to "v1", "k2" to "v2"))
-        val r = readConnectRequest(ByteArrayInputStream(bytes))
-        assertEquals("https://a/b", r.dest); assertEquals(1, r.type); assertEquals("v2", r.meta("k2"))
-        val out = java.io.ByteArrayOutputStream()
-        writeConnectResponse(out, "boom", listOf("HttpStatus" to "502"))
-        val back = parseEdgeResponse(out.toByteArray())
-        assertEquals("boom", back.error); assertEquals(502, back.status)
-        assertContentEquals(DATA_SIG, out.toByteArray().copyOf(6))
-    }
-
-    @Test fun `wrong stream signature is rejected`() {
-        assertFailsWith<TunnelException.Internal> { readConnectRequest(ByteArrayInputStream(ByteArray(64))) }
     }
 
     @Test fun `backoff curve matches the Rust crate`() {

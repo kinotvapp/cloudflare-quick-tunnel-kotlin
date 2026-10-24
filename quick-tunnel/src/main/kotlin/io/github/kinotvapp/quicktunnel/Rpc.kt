@@ -1,6 +1,5 @@
 package io.github.kinotvapp.quicktunnel
 
-import tech.kwik.core.QuicStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.util.UUID
@@ -15,13 +14,11 @@ val REGISTRATION_SERVER_ID = 0xf71695ec7fe85497UL.toLong()
 class RegistrationDetails(val uuid: UUID, val location: String, val remotelyManaged: Boolean)
 
 /**
- * Hand-rolled two-party Cap'n Proto RPC over the QUIC control stream. Only what the edge needs:
+ * Hand-rolled two-party Cap'n Proto RPC over the control stream. Only what the edge needs:
  * Bootstrap + Call (registerConnection / unregisterConnection) as client, and a stub bootstrap
  * as server so the edge's liveness probe does not mark the tunnel offline (HTTP 530).
  */
 class ControlSession(private val inp: InputStream, private val out: OutputStream, private val onClosed: (Throwable) -> Unit = {}) {
-    constructor(stream: QuicStream, onClosed: (Throwable) -> Unit = {}) : this(stream.inputStream, stream.outputStream, onClosed)
-
     private val pending = ConcurrentHashMap<Int, CompletableFuture<StructR>>()
     private var nextQuestion = 0
 

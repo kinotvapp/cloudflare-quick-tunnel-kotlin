@@ -1,6 +1,5 @@
 package io.github.kinotvapp.quicktunnel
 
-import tech.kwik.core.QuicStream
 import java.io.ByteArrayOutputStream
 import java.io.EOFException
 import java.io.IOException
@@ -12,13 +11,11 @@ import java.net.SocketTimeoutException
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
 
-val DATA_SIG = byteArrayOf(0x0A, 0x36, 0xCD.toByte(), 0x12, 0xA1.toByte(), 0x3E)
 const val HTTP_HEADER = "HttpHeader"
 const val HTTP_METHOD_KEY = "HttpMethod"
 const val HTTP_HOST_KEY = "HttpHost"
 const val HTTP_STATUS_KEY = "HttpStatus"
 const val MAX_HEADER_BYTES = 32 * 1024
-private const val TYPE_TCP = 2
 
 class TunnelMetrics {
     val streams = AtomicLong(); val bytesIn = AtomicLong(); val bytesOut = AtomicLong(); val reconnects = AtomicLong()
@@ -29,29 +26,9 @@ class TunnelMetrics {
     override fun toString() = "streams=$streams completed=$completed in=$bytesIn out=$bytesOut reconnects=$reconnects"
 }
 
-class ConnectReq(val dest: String, val type: Int, val metadata: List<Pair<String, String>>, val chunkRequestBody: Boolean = false) {
+class ConnectReq(val dest: String, val metadata: List<Pair<String, String>>, val chunkRequestBody: Boolean = false) {
     fun meta(key: String) = metadata.firstOrNull { it.first == key }?.second
     fun headers() = metadata.filter { it.first.startsWith("$HTTP_HEADER:") }.map { it.first.removePrefix("$HTTP_HEADER:") to it.second }
-}
-
-/** Reads preamble (6-byte signature + 2-byte version) and the capnp ConnectRequest. */
-fun readConnectRequest(i: InputStream): ConnectReq {
-    val sig = ByteArray(6).also { i.readFully(it) }
-    if (!sig.contentEquals(DATA_SIG)) throw TunnelException.Internal("unexpected stream signature")
-    ByteArray(2).also { i.readFully(it) }
-    val req = CapnpMessage.read(i).root() ?: throw TunnelException.Internal("empty ConnectRequest")
-    return ConnectReq(req.text(0) ?: "", req.u16(0), req.structList(1).map { (it.text(0) ?: "") to (it.text(1) ?: "") })
-}
-
-/** Writes preamble + ConnectResponse { error, metadata }. */
-fun writeConnectResponse(o: OutputStream, error: String, metadata: List<Pair<String, String>>) {
-    val frame = CapnpBuilder().apply {
-        val resp = root(0, 2)
-        if (error.isNotEmpty()) text(resp, error)
-        val list = structList(resp + 1, metadata.size, 0, 2)
-        metadata.forEachIndexed { n, (k, v) -> text(list + n * 2, k); text(list + n * 2 + 1, v) }
-    }.frame()
-    o.write(DATA_SIG); o.write("01".toByteArray()); o.write(frame); o.flush()
 }
 
 fun extractPath(dest: String): String {
@@ -150,37 +127,18 @@ fun readResponseHead(i: InputStream): ResponseHead {
     return ResponseHead(status, headers, all.copyOfRange(end, all.size))
 }
 
-// ── Where the response goes: a QUIC stream or an HTTP/2 stream ───────────────
+// ── Where the response goes ──────────────────────────────────────────────────
 
-/** The two transports differ only in how a response is framed; the proxying logic is shared. */
+/** How a response is framed on the wire; the proxying logic does not care. */
 interface ResponseSink {
     /** Sends the status line and headers, once, before any body byte. */
     fun head(status: Int, headers: List<Pair<String, String>>)
     /** Replaces [head] when the origin could not be reached. */
     fun error(status: Int, message: String)
-    /** Accepts a raw TCP stream (QUIC only). */
-    fun acceptTcp()
     val body: OutputStream
     /** Ends the response. Idempotent. */
     fun finish()
 }
-
-/** QUIC: preamble + capnp ConnectResponse, then the raw body on the same stream. */
-class QuicSink(private val out: OutputStream) : ResponseSink {
-    override fun head(status: Int, headers: List<Pair<String, String>>) {
-        val meta = buildList {
-            add(HTTP_STATUS_KEY to status.toString())
-            headers.forEach { add("$HTTP_HEADER:${it.first}" to it.second) }
-        }
-        writeConnectResponse(out, "", meta)
-    }
-    override fun error(status: Int, message: String) = writeConnectResponse(out, message, listOf(HTTP_STATUS_KEY to status.toString()))
-    override fun acceptTcp() = writeConnectResponse(out, "", emptyList())
-    override val body get() = out
-    override fun finish() { runCatching { out.close() } }
-}
-
-fun errorResponse(o: OutputStream, status: Int, msg: String) = QuicSink(o).error(status, msg)
 
 /** Counts the stream, runs [block], and turns any failure into a 502 unless the response already started. */
 internal fun serve(sink: ResponseSink, m: TunnelMetrics, block: (onStarted: () -> Unit) -> Unit) {
@@ -194,20 +152,6 @@ internal fun serve(sink: ResponseSink, m: TunnelMetrics, block: (onStarted: () -
         sink.finish()
         m.completed.incrementAndGet()
         m.onCompleted?.invoke()
-    }
-}
-
-// ── One QUIC stream, start to finish ─────────────────────────────────────────
-
-fun proxyStream(s: QuicStream, localPort: Int, pool: LocalPool, metrics: TunnelMetrics) =
-    proxyConnection(s.inputStream, s.outputStream, localPort, pool, metrics)
-
-fun proxyConnection(edgeIn: InputStream, edgeOut: OutputStream, localPort: Int, pool: LocalPool, metrics: TunnelMetrics) {
-    val sink = QuicSink(edgeOut)
-    serve(sink, metrics) { started ->
-        val req = readConnectRequest(edgeIn)
-        if (req.type == TYPE_TCP) pipeTcp(edgeIn, sink, localPort, metrics)
-        else proxyHttp(edgeIn, sink, req, pool, metrics, started)
     }
 }
 
@@ -293,15 +237,6 @@ private fun writeLeftover(out: OutputStream, resp: ResponseHead, m: TunnelMetric
 private fun bodyOf(src: InputStream, resp: ResponseHead, rs: ResponseShape): InputStream {
     val all = SequenceInputStream(resp.leftover.inputStream(), src)
     return if (rs.chunked) ChunkedInputStream(all) else all
-}
-
-private fun pipeTcp(edgeIn: InputStream, sink: ResponseSink, port: Int, m: TunnelMetrics) {
-    Socket("127.0.0.1", port).use { sock ->
-        sink.acceptTcp()
-        val up = thread(isDaemon = true) { runCatching { copy(edgeIn, sock.getOutputStream(), m.bytesIn); sock.shutdownOutput() } }
-        copy(sock.getInputStream(), sink.body, m.bytesOut)
-        up.join(1000)
-    }
 }
 
 /** Re-chunks a body of unknown length (an HTTP/2 request without Content-Length) for an HTTP/1.1 origin. */

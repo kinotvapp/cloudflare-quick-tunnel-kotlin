@@ -1,6 +1,5 @@
 package io.github.kinotvapp.quicktunnel
 
-import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.net.ServerSocket
 import java.security.MessageDigest
@@ -13,7 +12,7 @@ import kotlin.test.assertTrue
 
 class ProxyTest {
     private fun get(path: String, vararg h: Pair<String, String>, method: String = "GET") =
-        connectRequestBytes("https://x.trycloudflare.com$path", 0, httpRequestMeta(method, "x.trycloudflare.com", *h))
+        ConnectReq("https://x.trycloudflare.com$path", httpRequestMeta(method, "x.trycloudflare.com", *h))
 
     @Test fun `simple GET returns status headers and body`() {
         FakeOrigin { _, path, _, _, out -> out.respond("200 OK", "hello $path".toByteArray(), "Content-Type: text/plain"); true }.use { origin ->
@@ -67,9 +66,9 @@ class ProxyTest {
             out.respond("200 OK", MessageDigest.getInstance("SHA-256").digest(body)); true
         }.use { origin ->
             val pool = LocalPool(origin.port)
-            val req = connectRequestBytes("https://x.trycloudflare.com/up", 0, httpRequestMeta("POST", "x.trycloudflare.com", "Content-Length" to payload.size.toString())) + payload
+            val req = ConnectReq("https://x.trycloudflare.com/up", httpRequestMeta("POST", "x.trycloudflare.com", "Content-Length" to payload.size.toString()))
             val metrics = TunnelMetrics()
-            val r = runProxy(req, origin.port, pool, metrics)
+            val r = runProxy(req, origin.port, pool, metrics, edgeBody = payload)
             assertContentEquals(MessageDigest.getInstance("SHA-256").digest(payload), r.body)
             assertEquals(payload.size.toLong(), metrics.bytesIn.get())
             pool.close()
@@ -139,22 +138,11 @@ class ProxyTest {
             }
         }
         val pool = LocalPool(server.localPort)
-        val head = connectRequestBytes("https://x.trycloudflare.com/ws", 0, httpRequestMeta("GET", "x.trycloudflare.com", "Connection" to "Upgrade", "Upgrade" to "websocket"))
-        val out = ByteArrayOutputStream()
-        proxyConnection(ByteArrayInputStream(head + "ping".toByteArray()), out, server.localPort, pool, TunnelMetrics())
-        val r = parseEdgeResponse(out.toByteArray())
+        val req = ConnectReq("https://x.trycloudflare.com/ws", httpRequestMeta("GET", "x.trycloudflare.com", "Connection" to "Upgrade", "Upgrade" to "websocket"))
+        val r = runProxy(req, server.localPort, pool, edgeBody = "ping".toByteArray())
         assertEquals(101, r.status)
         assertEquals("echo:ping", String(r.body))
         assertEquals(0, pool.idleCount())
-        server.close()
-    }
-
-    @Test fun `TCP streams are piped raw`() {
-        val server = ServerSocket(0, 5, java.net.InetAddress.getByName("127.0.0.1"))
-        thread(isDaemon = true) { server.accept().use { s -> val d = s.getInputStream().readBytes(); s.getOutputStream().write(d.reversedArray()) } }
-        val out = ByteArrayOutputStream()
-        proxyConnection(ByteArrayInputStream(connectRequestBytes("127.0.0.1:1", 2, emptyList()) + "abc".toByteArray()), out, server.localPort, LocalPool(server.localPort), TunnelMetrics())
-        assertEquals("cba", String(parseEdgeResponse(out.toByteArray()).body))
         server.close()
     }
 

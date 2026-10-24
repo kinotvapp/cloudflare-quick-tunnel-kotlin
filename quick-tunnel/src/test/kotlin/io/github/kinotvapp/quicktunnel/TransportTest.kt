@@ -20,90 +20,56 @@ class TransportTest {
     private val open = mutableListOf<AutoCloseable>()
     @AfterTest fun cleanup() = open.forEach { runCatching { it.close() } }
 
-    @Test fun `transport order follows the policy and the learned preference`() {
-        assertEquals(listOf(Transport.QUIC, Transport.HTTP2), transportOrder(TransportPolicy.AUTO, preferHttp2 = false))
-        assertEquals(listOf(Transport.HTTP2, Transport.QUIC), transportOrder(TransportPolicy.AUTO, preferHttp2 = true))
-        assertEquals(listOf(Transport.QUIC), transportOrder(TransportPolicy.QUIC_ONLY, preferHttp2 = true))
-        assertEquals(listOf(Transport.HTTP2), transportOrder(TransportPolicy.HTTP2_ONLY, preferHttp2 = false))
-    }
-
-    // ── connectCycle policy, with fake dialers ───────────────────────────────
+    // ── connectCycle policy, with a fake dialer ──────────────────────────────
 
     private val tunnel = QuickTunnel(UUID.randomUUID(), "t.trycloudflare.com", "tag", ByteArray(32))
     private val edges = (1..6).map { EdgeAddr(InetAddress.getByName("198.41.192.$it"), 7844) }
-    private fun stubLink(t: Transport) = Link(t, ControlSession(ByteArrayInputStream(ByteArray(0)), ByteArrayOutputStream()), "loc", {}, {})
 
-    private class Recorder : TunnelListener {
-        val fallbacks = CopyOnWriteArrayList<String>()
-        override fun onTransportFallback(connIndex: Int, reason: String) { fallbacks += reason }
+    /** Fails on the first [failures] edges, then works; [error] is what a failing dial throws. */
+    private class Dialer(val failures: Int = 0, val error: Exception = IOException("tls failed")) {
+        val calls = CopyOnWriteArrayList<EdgeAddr>()
+        val dial: EdgeDialer = { edge, _, _ ->
+            calls += edge
+            if (calls.size <= failures) throw error
+            Link(ControlSession(ByteArrayInputStream(ByteArray(0)), ByteArrayOutputStream()), "loc", {}, {})
+        }
     }
 
-    private class Dialers(val quicWorks: Boolean = false, val h2Works: Boolean = true, val quicError: Exception = IOException("handshake timed out")) {
-        val calls = CopyOnWriteArrayList<Transport>()
-        val map: Map<Transport, EdgeDialer> = mapOf(
-            Transport.QUIC to { _, _, _ -> calls += Transport.QUIC; if (quicWorks) Link(Transport.QUIC, ControlSession(ByteArrayInputStream(ByteArray(0)), ByteArrayOutputStream()), "q", {}, {}) else throw quicError },
-            Transport.HTTP2 to { _, _, _ -> calls += Transport.HTTP2; if (h2Works) Link(Transport.HTTP2, ControlSession(ByteArrayInputStream(ByteArray(0)), ByteArrayOutputStream()), "h", {}, {}) else throw IOException("tls failed") },
-        )
+    private fun runtime(d: Dialer): QuickTunnelHandle.Runtime {
+        val reg = EdgeRegistry(discover = { edges })
+        val cfg = QuickTunnelManager(1, registry = reg)
+        return QuickTunnelHandle.Runtime(cfg, tunnel, reg, d.dial).also { open += AutoCloseable { it.shutdown() } }
     }
 
-    private fun runtime(policy: TransportPolicy, d: Dialers, listener: TunnelListener = Recorder(), now: () -> Long = System::currentTimeMillis): QuickTunnelHandle.Runtime {
-        val cfg = QuickTunnelManager(1, transport = policy, listener = listener, registry = EdgeRegistry(discover = { edges }))
-        return QuickTunnelHandle.Runtime(cfg, tunnel, EdgeRegistry(discover = { edges }), d.map, now).also { open += AutoCloseable { it.shutdown() } }
+    @Test fun `the first edge that works is used and the rest are not touched`() {
+        val d = Dialer(); val rt = runtime(d)
+        assertEquals("loc", rt.connectCycle(0, false).location); assertEquals(1, d.calls.size)
     }
 
-    @Test fun `AUTO uses QUIC when it works and never touches TCP`() {
-        val d = Dialers(quicWorks = true); val rt = runtime(TransportPolicy.AUTO, d)
-        assertEquals(Transport.QUIC, rt.connectCycle(0, false).transport); assertEquals(listOf(Transport.QUIC), d.calls)
+    @Test fun `a failing edge moves on to the next one`() {
+        val d = Dialer(failures = 2); val rt = runtime(d)
+        rt.connectCycle(0, false)
+        assertEquals(3, d.calls.toSet().size, "each failure moves on to a different edge: ${d.calls}")
     }
 
-    @Test fun `AUTO falls back to HTTP2 after trying only two QUIC edges and reports why`() {
-        val d = Dialers(quicWorks = false); val rec = Recorder(); val rt = runtime(TransportPolicy.AUTO, d, rec)
-        val link = rt.connectCycle(0, false)
-        assertEquals(Transport.HTTP2, link.transport)
-        assertEquals(listOf(Transport.QUIC, Transport.QUIC, Transport.HTTP2), d.calls, "2 QUIC edges, then HTTP2 works on its first edge")
-        assertEquals(1, rec.fallbacks.size); assertTrue("handshake timed out" in rec.fallbacks[0], rec.fallbacks[0])
+    @Test fun `it tries up to five edges and then reports every distinct failure`() {
+        val d = Dialer(failures = 99); val rt = runtime(d)
+        val e = assertFailsWith<TunnelException.EdgeDial> { rt.connectCycle(0, false) }
+        assertEquals(MAX_EDGES_PER_CYCLE, d.calls.size)
+        assertTrue(e.transient && "tls failed" in e.message!!, e.message)
     }
 
-    @Test fun `after a fallback HTTP2 goes first until the preference expires`() {
-        var now = 1_000L
-        val d = Dialers(quicWorks = false); val rt = runtime(TransportPolicy.AUTO, d, now = { now })
-        rt.connectCycle(0, false); d.calls.clear()
-        rt.connectCycle(0, true)
-        assertEquals(listOf(Transport.HTTP2), d.calls, "no QUIC timeout is paid again")
-        now += PREFER_HTTP2_MS + 1; d.calls.clear()
-        rt.connectCycle(0, true)
-        assertEquals(Transport.QUIC, d.calls.first(), "QUIC is retried once the preference expires")
-    }
-
-    @Test fun `AUTO tries up to five HTTP2 edges`() {
-        val d = Dialers(quicWorks = false, h2Works = false); val rt = runtime(TransportPolicy.AUTO, d)
-        val e = assertFailsWith<TunnelException.QuicDial> { rt.connectCycle(0, false) }
-        assertEquals(2, d.calls.count { it == Transport.QUIC }); assertEquals(MAX_EDGES_PER_CYCLE, d.calls.count { it == Transport.HTTP2 })
-        assertTrue(e.transient && "HTTP2" in e.message!!, e.message)
-    }
-
-    @Test fun `QUIC_ONLY never falls back`() {
-        val d = Dialers(quicWorks = false); val rt = runtime(TransportPolicy.QUIC_ONLY, d)
-        assertFailsWith<TunnelException.QuicDial> { rt.connectCycle(0, false) }
-        assertTrue(d.calls.none { it == Transport.HTTP2 }); assertEquals(MAX_EDGES_PER_CYCLE, d.calls.size)
-    }
-
-    @Test fun `HTTP2_ONLY never touches QUIC`() {
-        val d = Dialers(quicWorks = true); val rt = runtime(TransportPolicy.HTTP2_ONLY, d)
-        assertEquals(Transport.HTTP2, rt.connectCycle(0, false).transport); assertEquals(listOf(Transport.HTTP2), d.calls)
-    }
-
-    @Test fun `a refusal from the edge is final and is not retried on another transport`() {
-        val d = Dialers(quicWorks = false, quicError = TunnelException.Register("bad credentials")); val rt = runtime(TransportPolicy.AUTO, d)
+    @Test fun `a refusal from the edge is final and is not retried on another edge`() {
+        val d = Dialer(failures = 99, error = TunnelException.Register("bad credentials")); val rt = runtime(d)
         assertFailsWith<TunnelException.Register> { rt.connectCycle(0, false) }
-        assertEquals(listOf(Transport.QUIC), d.calls)
+        assertEquals(1, d.calls.size)
     }
 
     // ── the real HTTP/2 registration path, over a loopback socket ───────────
 
     private fun h2Fixture(controlWaitS: Long = 10): Triple<QuickTunnelHandle.Runtime, java.net.Socket, MiniH2Client> {
         val (serverSide, clientSide) = socketPair()
-        val cfg = QuickTunnelManager(1, transport = TransportPolicy.HTTP2_ONLY)
+        val cfg = QuickTunnelManager(1)
         val rt = QuickTunnelHandle.Runtime(cfg, tunnel, EdgeRegistry(discover = { edges }), h2ControlWaitS = controlWaitS).also { open += AutoCloseable { it.shutdown() } }
         open += AutoCloseable { serverSide.close() }
         val client = MiniH2Client(clientSide).also { open += it }
@@ -125,7 +91,7 @@ class TransportTest {
             }); true
         }
         val link = future.get(10, TimeUnit.SECONDS)
-        assertEquals(Transport.HTTP2, link.transport); assertEquals("bog04", link.location)
+        assertEquals("bog04", link.location)
         assertEquals(200, st.status, "the control stream is answered with 200 before any RPC bytes")
         val call = peer.calls.single()
         assertEquals(0xf71695ec7fe85497UL.toLong(), call.iface)
@@ -178,8 +144,8 @@ class TransportTest {
         val tries = java.util.concurrent.atomic.AtomicInteger()
         val failing: EdgeDialer = { _, _, _ -> tries.incrementAndGet(); throw IOException("network is unreachable") }
         val events = Events()
-        val cfg = QuickTunnelManager(1, transport = TransportPolicy.QUIC_ONLY, listener = events, registry = EdgeRegistry(discover = { edges }))
-        val rt = QuickTunnelHandle.Runtime(cfg, tunnel, EdgeRegistry(discover = { edges }), mapOf(Transport.QUIC to failing)).also { open += AutoCloseable { it.shutdown() } }
+        val cfg = QuickTunnelManager(1, listener = events, registry = EdgeRegistry(discover = { edges }))
+        val rt = QuickTunnelHandle.Runtime(cfg, tunnel, EdgeRegistry(discover = { edges }), failing).also { open += AutoCloseable { it.shutdown() } }
         rt.startReactor(0, null, firstTryImmediately = true)
 
         // Wait until it is sleeping in a multi-second backoff.
@@ -200,8 +166,8 @@ class TransportTest {
     @Test fun `shutdown wakes reactors that are sleeping in a backoff`() {
         val failing: EdgeDialer = { _, _, _ -> throw IOException("down") }
         val events = Events()
-        val cfg = QuickTunnelManager(1, transport = TransportPolicy.QUIC_ONLY, listener = events, registry = EdgeRegistry(discover = { edges }))
-        val rt = QuickTunnelHandle.Runtime(cfg, tunnel, EdgeRegistry(discover = { edges }), mapOf(Transport.QUIC to failing))
+        val cfg = QuickTunnelManager(1, listener = events, registry = EdgeRegistry(discover = { edges }))
+        val rt = QuickTunnelHandle.Runtime(cfg, tunnel, EdgeRegistry(discover = { edges }), failing)
         rt.startReactor(0, null, firstTryImmediately = true)
         val end = System.currentTimeMillis() + 15_000
         while (events.reconnecting.none { it.second >= 4_000 } && System.currentTimeMillis() < end) Thread.sleep(20)
@@ -220,13 +186,13 @@ class TransportTest {
     private fun limitRuntime(events: LimitEvents, maxLifetimeMs: Long = 0, maxRequests: Long = 0): QuickTunnelHandle.Runtime {
         val reg = EdgeRegistry(discover = { edges })
         val cfg = QuickTunnelManager(1, listener = events, maxLifetimeMs = maxLifetimeMs, maxRequests = maxRequests, registry = reg)
-        val rt = QuickTunnelHandle.Runtime(cfg, tunnel, reg, emptyMap())
+        val rt = QuickTunnelHandle.Runtime(cfg, tunnel, reg)
         rt.startLimits()
         open += AutoCloseable { rt.shutdown() }
         return rt
     }
 
-    private fun serveOne(rt: QuickTunnelHandle.Runtime) = serve(QuicSink(ByteArrayOutputStream()), rt.metrics) { }
+    private fun serveOne(rt: QuickTunnelHandle.Runtime) = serve(RecordingSink(), rt.metrics) { }
 
     @Test fun `maxRequests closes the tunnel when the last allowed request finishes`() {
         val events = LimitEvents(); val rt = limitRuntime(events, maxRequests = 3)
@@ -238,7 +204,7 @@ class TransportTest {
 
     @Test fun `a failed request still counts as served`() {
         val events = LimitEvents(); val rt = limitRuntime(events, maxRequests = 1)
-        serve(QuicSink(ByteArrayOutputStream()), rt.metrics) { error("origin exploded") }
+        serve(RecordingSink(), rt.metrics) { error("origin exploded") }
         assertEquals(listOf(TunnelLimit.REQUESTS), events.limits)
     }
 
@@ -276,7 +242,7 @@ class TransportTest {
         lateinit var rt: QuickTunnelHandle.Runtime
         val listener = object : TunnelListener { override fun onLimitReached(limit: TunnelLimit) { rt.shutdown(); closed.complete(Unit) } }
         val reg = EdgeRegistry(discover = { edges })
-        rt = QuickTunnelHandle.Runtime(QuickTunnelManager(1, listener = listener, maxRequests = 1, registry = reg), tunnel, reg, emptyMap())
+        rt = QuickTunnelHandle.Runtime(QuickTunnelManager(1, listener = listener, maxRequests = 1, registry = reg), tunnel, reg)
         rt.startLimits()
         serveOne(rt)
         closed.get(5, TimeUnit.SECONDS)

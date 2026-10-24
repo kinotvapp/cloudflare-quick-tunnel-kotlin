@@ -15,7 +15,7 @@ import java.security.spec.EllipticCurve
 import java.security.spec.InvalidParameterSpecException
 
 /**
- * Kwik's TLS asks the platform for `AlgorithmParameters.getInstance("EC")` to turn a curve name into its parameters.
+ * A TLS stack that asks the platform for `AlgorithmParameters.getInstance("EC")` to turn a curve name into its parameters.
  * Android's providers do not offer that before Android 14, so every QUIC handshake died with "Missing support for EC
  * algorithm" on Android 7 to 13. This installs a tiny provider with the three NIST curves TLS 1.3 uses, only when the
  * platform lacks the algorithm.

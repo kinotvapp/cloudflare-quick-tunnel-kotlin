@@ -16,7 +16,7 @@ sealed class TunnelException(message: String, val transient: Boolean = false, ca
 
     class Discovery(message: String, cause: Throwable? = null) : TunnelException("edge discovery failed: $message", transient = true, cause = cause)
 
-    class QuicDial(val attempts: Int, val last: String) : TunnelException("QUIC dial failed after $attempts attempt(s); last: $last", transient = true)
+    class EdgeDial(val attempts: Int, val last: String) : TunnelException("edge connect failed after $attempts attempt(s); last: $last", transient = true)
 
     open class Register(message: String) : TunnelException("RegisterConnection failed: $message")
 

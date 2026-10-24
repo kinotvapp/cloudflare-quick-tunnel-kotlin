@@ -46,7 +46,6 @@ class H2Sink(private val resp: Http2Response) : ResponseSink {
     override fun error(status: Int, message: String) =
         resp.sendHeaders(status, listOf(H2Headers.RESPONSE_META to H2Headers.META_CLOUDFLARED), endStream = true)
 
-    override fun acceptTcp() = error(502, "TCP streams are not supported over HTTP/2")
     override val body get() = resp.body
     override fun finish() { runCatching { resp.finish() } }
 }
@@ -74,7 +73,7 @@ internal fun routeH2(req: Http2Request, ctx: H2Context) {
         }
         else -> {
             val sink = H2Sink(req.response)
-            if (req.header(H2Headers.TCP_SRC) != null) serve(sink, ctx.metrics) { sink.acceptTcp() }
+            if (req.header(H2Headers.TCP_SRC) != null) serve(sink, ctx.metrics) { sink.error(502, "TCP streams are not supported over HTTP/2") }
             else serve(sink, ctx.metrics) { started -> proxyHttp(req.body, sink, toConnectReq(req), ctx.pool, ctx.metrics, started) }
         }
     }
@@ -101,5 +100,5 @@ internal fun toConnectReq(req: Http2Request): ConnectReq {
         if (regular.none { it.first == "connection" }) metadata += "$HTTP_HEADER:Connection" to "Upgrade"
         if (regular.none { it.first == "upgrade" }) metadata += "$HTTP_HEADER:Upgrade" to "websocket"
     }
-    return ConnectReq(req.header(":path") ?: "/", 0, metadata, chunkRequestBody = chunk)
+    return ConnectReq(req.header(":path") ?: "/", metadata, chunkRequestBody = chunk)
 }
