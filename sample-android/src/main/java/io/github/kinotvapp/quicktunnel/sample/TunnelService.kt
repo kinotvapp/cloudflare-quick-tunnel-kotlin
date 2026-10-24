@@ -47,6 +47,8 @@ class TunnelService : Service() {
                 val t0 = System.currentTimeMillis()
                 handle = QuickTunnelManager(PORT, listener = object : TunnelListener {
                     override fun onRegistered(connIndex: Int, location: String) { Log.i(TAG, "registered conn=$connIndex location=$location") }
+                    override fun onTransport(connIndex: Int, transport: io.github.kinotvapp.quicktunnel.Transport) { Log.i(TAG, "conn=$connIndex transport=$transport") }
+                    override fun onTransportFallback(connIndex: Int, reason: String) { Log.w(TAG, "QUIC unavailable, using HTTP/2 over TCP: $reason") }
                     override fun onLost(connIndex: Int, reason: String) { Log.w(TAG, "LOST conn=$connIndex ($reason)") }
                     override fun onReconnecting(connIndex: Int, attempt: Int, delayMs: Long) { Log.i(TAG, "reconnecting conn=$connIndex attempt=$attempt in ${delayMs}ms") }
                     override fun onReconnectFailed(connIndex: Int, attempt: Int, error: io.github.kinotvapp.quicktunnel.TunnelException) { Log.w(TAG, "reconnect FAILED conn=$connIndex attempt=$attempt: ${error.message}") }

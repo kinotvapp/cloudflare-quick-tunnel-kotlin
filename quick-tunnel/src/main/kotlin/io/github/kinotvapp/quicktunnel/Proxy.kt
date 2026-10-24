@@ -25,7 +25,7 @@ class TunnelMetrics {
     override fun toString() = "streams=$streams in=$bytesIn out=$bytesOut reconnects=$reconnects"
 }
 
-class ConnectReq(val dest: String, val type: Int, val metadata: List<Pair<String, String>>) {
+class ConnectReq(val dest: String, val type: Int, val metadata: List<Pair<String, String>>, val chunkRequestBody: Boolean = false) {
     fun meta(key: String) = metadata.firstOrNull { it.first == key }?.second
     fun headers() = metadata.filter { it.first.startsWith("$HTTP_HEADER:") }.map { it.first.removePrefix("$HTTP_HEADER:") to it.second }
 }
@@ -146,34 +146,74 @@ fun readResponseHead(i: InputStream): ResponseHead {
     return ResponseHead(status, headers, all.copyOfRange(end, all.size))
 }
 
-// ── One edge-opened stream, start to finish ──────────────────────────────────
+// ── Where the response goes: a QUIC stream or an HTTP/2 stream ───────────────
+
+/** The two transports differ only in how a response is framed; the proxying logic is shared. */
+interface ResponseSink {
+    /** Sends the status line and headers, once, before any body byte. */
+    fun head(status: Int, headers: List<Pair<String, String>>)
+    /** Replaces [head] when the origin could not be reached. */
+    fun error(status: Int, message: String)
+    /** Accepts a raw TCP stream (QUIC only). */
+    fun acceptTcp()
+    val body: OutputStream
+    /** Ends the response. Idempotent. */
+    fun finish()
+}
+
+/** QUIC: preamble + capnp ConnectResponse, then the raw body on the same stream. */
+class QuicSink(private val out: OutputStream) : ResponseSink {
+    override fun head(status: Int, headers: List<Pair<String, String>>) {
+        val meta = buildList {
+            add(HTTP_STATUS_KEY to status.toString())
+            headers.forEach { add("$HTTP_HEADER:${it.first}" to it.second) }
+        }
+        writeConnectResponse(out, "", meta)
+    }
+    override fun error(status: Int, message: String) = writeConnectResponse(out, message, listOf(HTTP_STATUS_KEY to status.toString()))
+    override fun acceptTcp() = writeConnectResponse(out, "", emptyList())
+    override val body get() = out
+    override fun finish() { runCatching { out.close() } }
+}
+
+fun errorResponse(o: OutputStream, status: Int, msg: String) = QuicSink(o).error(status, msg)
+
+/** Counts the stream, runs [block], and turns any failure into a 502 unless the response already started. */
+internal fun serve(sink: ResponseSink, m: TunnelMetrics, block: (onStarted: () -> Unit) -> Unit) {
+    m.streams.incrementAndGet()
+    var started = false // once the response head is out, an error response would corrupt the stream
+    try {
+        block { started = true }
+    } catch (e: Exception) {
+        if (!started) runCatching { sink.error(502, "proxy error: ${e.message}") }
+    } finally {
+        sink.finish()
+    }
+}
+
+// ── One QUIC stream, start to finish ─────────────────────────────────────────
 
 fun proxyStream(s: QuicStream, localPort: Int, pool: LocalPool, metrics: TunnelMetrics) =
     proxyConnection(s.inputStream, s.outputStream, localPort, pool, metrics)
 
 fun proxyConnection(edgeIn: InputStream, edgeOut: OutputStream, localPort: Int, pool: LocalPool, metrics: TunnelMetrics) {
-    metrics.streams.incrementAndGet()
-    var started = false // once the response head is out, an error response would corrupt the stream
-    try {
+    val sink = QuicSink(edgeOut)
+    serve(sink, metrics) { started ->
         val req = readConnectRequest(edgeIn)
-        if (req.type == TYPE_TCP) pipeTcp(edgeIn, edgeOut, localPort, metrics)
-        else proxyHttp(edgeIn, edgeOut, req, pool, metrics) { started = true }
-    } catch (e: Exception) {
-        if (!started) runCatching { errorResponse(edgeOut, 502, "proxy error: ${e.message}") }
-    } finally {
-        runCatching { edgeOut.close() }
+        if (req.type == TYPE_TCP) pipeTcp(edgeIn, sink, localPort, metrics)
+        else proxyHttp(edgeIn, sink, req, pool, metrics, started)
     }
 }
 
-private fun proxyHttp(edgeIn: InputStream, edgeOut: OutputStream, req: ConnectReq, pool: LocalPool, m: TunnelMetrics, onStarted: () -> Unit) {
+fun proxyHttp(edgeIn: InputStream, sink: ResponseSink, req: ConnectReq, pool: LocalPool, m: TunnelMetrics, onStarted: () -> Unit) {
     val shape = analyseRequest(req)
     val method = req.meta(HTTP_METHOD_KEY) ?: "GET"
     var lease = try {
         pool.acquire()
     } catch (e: SocketTimeoutException) {
-        return errorResponse(edgeOut, 504, "local connect timed out")
+        return sink.error(504, "local connect timed out")
     } catch (e: IOException) {
-        return errorResponse(edgeOut, 502, "local connect: ${e.message}")
+        return sink.error(502, "local connect: ${e.message}")
     }
     val head = buildRequestHead(req, shape.poolable)
     val bodyless = (shape.contentLength ?: 0L) == 0L && !shape.chunked && !shape.upgrade
@@ -196,19 +236,19 @@ private fun proxyHttp(edgeIn: InputStream, edgeOut: OutputStream, req: ConnectRe
                 }
             }
             val rs = analyseResponse(resp.status, resp.headers, isBodiless(method, resp.status))
-            sendHead(edgeOut, resp, rs, onStarted)
+            sendHead(sink, resp, rs, onStarted)
             if (rs.poolable) {
                 val remaining = (rs.contentLength ?: 0) - resp.leftover.size
-                writeLeftover(edgeOut, resp, m)
-                if (remaining > 0) copyN(lease.input, edgeOut, remaining, m.bytesOut)
-                edgeOut.flush(); edgeOut.close()
+                writeLeftover(sink.body, resp, m)
+                if (remaining > 0) copyN(lease.input, sink.body, remaining, m.bytesOut)
+                sink.finish()
                 pool.release(lease); released = true
             } else {
-                copy(bodyOf(lease.input, resp, rs), edgeOut, m.bytesOut)
-                edgeOut.flush()
+                copy(bodyOf(lease.input, resp, rs), sink.body, m.bytesOut)
+                sink.body.flush()
             }
         } else {
-            runBidi(edgeIn, edgeOut, lease, head, method, m, onStarted)
+            runBidi(edgeIn, sink, lease, head, method, req.chunkRequestBody, m, onStarted)
         }
     } finally {
         if (!released) lease.discard()
@@ -216,31 +256,30 @@ private fun proxyHttp(edgeIn: InputStream, edgeOut: OutputStream, req: ConnectRe
 }
 
 /** WebSocket upgrades, chunked uploads and Connection: close requests: two concurrent pumps, socket never pooled. */
-private fun runBidi(edgeIn: InputStream, edgeOut: OutputStream, lease: Lease, head: ByteArray, method: String, m: TunnelMetrics, onStarted: () -> Unit) {
+private fun runBidi(edgeIn: InputStream, sink: ResponseSink, lease: Lease, head: ByteArray, method: String, chunkBody: Boolean, m: TunnelMetrics, onStarted: () -> Unit) {
     lease.output.apply { write(head); flush() }
     thread(isDaemon = true, name = "cfqt-up") {
-        try { copy(edgeIn, lease.output, m.bytesIn); runCatching { lease.socket.shutdownOutput() } } catch (_: Exception) { /* local closed first */ }
+        try {
+            if (chunkBody) copyChunked(edgeIn, lease.output, m.bytesIn) else copy(edgeIn, lease.output, m.bytesIn)
+            runCatching { lease.socket.shutdownOutput() }
+        } catch (_: Exception) { /* local closed first */ }
     }
     val resp = readResponseHead(lease.input)
     val rs = analyseResponse(resp.status, resp.headers, isBodiless(method, resp.status))
-    sendHead(edgeOut, resp, rs, onStarted)
-    copy(bodyOf(lease.input, resp, rs), edgeOut, m.bytesOut)
-    edgeOut.flush()
+    sendHead(sink, resp, rs, onStarted)
+    copy(bodyOf(lease.input, resp, rs), sink.body, m.bytesOut)
+    sink.body.flush()
 }
 
 /** The edge does not re-chunk: decode here and drop the header, like cloudflared's http.Transport does. */
-private fun sendHead(edgeOut: OutputStream, resp: ResponseHead, rs: ResponseShape, onStarted: () -> Unit) {
-    val meta = buildList {
-        add(HTTP_STATUS_KEY to resp.status.toString())
-        resp.headers.filterNot { rs.chunked && it.first.equals("transfer-encoding", true) }.forEach { add("$HTTP_HEADER:${it.first}" to it.second) }
-    }
-    writeConnectResponse(edgeOut, "", meta)
+private fun sendHead(sink: ResponseSink, resp: ResponseHead, rs: ResponseShape, onStarted: () -> Unit) {
+    sink.head(resp.status, resp.headers.filterNot { rs.chunked && it.first.equals("transfer-encoding", true) })
     onStarted()
 }
 
-private fun writeLeftover(edgeOut: OutputStream, resp: ResponseHead, m: TunnelMetrics) {
+private fun writeLeftover(out: OutputStream, resp: ResponseHead, m: TunnelMetrics) {
     if (resp.leftover.isNotEmpty()) {
-        edgeOut.write(resp.leftover); m.bytesOut.addAndGet(resp.leftover.size.toLong())
+        out.write(resp.leftover); m.bytesOut.addAndGet(resp.leftover.size.toLong())
     }
 }
 
@@ -250,17 +289,26 @@ private fun bodyOf(src: InputStream, resp: ResponseHead, rs: ResponseShape): Inp
     return if (rs.chunked) ChunkedInputStream(all) else all
 }
 
-private fun pipeTcp(edgeIn: InputStream, edgeOut: OutputStream, port: Int, m: TunnelMetrics) {
+private fun pipeTcp(edgeIn: InputStream, sink: ResponseSink, port: Int, m: TunnelMetrics) {
     Socket("127.0.0.1", port).use { sock ->
-        writeConnectResponse(edgeOut, "", emptyList())
+        sink.acceptTcp()
         val up = thread(isDaemon = true) { runCatching { copy(edgeIn, sock.getOutputStream(), m.bytesIn); sock.shutdownOutput() } }
-        copy(sock.getInputStream(), edgeOut, m.bytesOut)
+        copy(sock.getInputStream(), sink.body, m.bytesOut)
         up.join(1000)
     }
 }
 
-fun errorResponse(o: OutputStream, status: Int, msg: String) =
-    writeConnectResponse(o, msg, listOf(HTTP_STATUS_KEY to status.toString()))
+/** Re-chunks a body of unknown length (an HTTP/2 request without Content-Length) for an HTTP/1.1 origin. */
+fun copyChunked(src: InputStream, dst: OutputStream, counter: AtomicLong) {
+    val buf = ByteArray(16 * 1024)
+    while (true) {
+        val n = src.read(buf)
+        if (n < 0) break
+        dst.write("${Integer.toHexString(n)}\r\n".toByteArray()); dst.write(buf, 0, n); dst.write("\r\n".toByteArray()); dst.flush()
+        counter.addAndGet(n.toLong())
+    }
+    dst.write("0\r\n\r\n".toByteArray()); dst.flush()
+}
 
 /** Copies until EOF, flushing each chunk so streaming bodies (SSE, downloads) are not held back. */
 fun copy(src: InputStream, dst: OutputStream, counter: AtomicLong) {

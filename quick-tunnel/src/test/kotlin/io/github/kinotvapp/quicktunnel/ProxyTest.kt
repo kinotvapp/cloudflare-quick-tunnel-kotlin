@@ -53,7 +53,7 @@ class ProxyTest {
             val pool = LocalPool(origin.port)
             assertEquals(200, runProxy(get("/1"), origin.port, pool).status)
             origin.closeClients()
-            Thread.sleep(100)
+            Thread.sleep(300) // the proxy must cope with both outcomes: close noticed (fresh socket) or not (retry)
             val r = runProxy(get("/2"), origin.port, pool)
             assertEquals(200, r.status, "edge error: ${r.error}")
             assertEquals(2, origin.accepted)

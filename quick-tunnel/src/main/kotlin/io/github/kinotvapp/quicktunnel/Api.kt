@@ -9,7 +9,6 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import java.net.HttpURLConnection
 import java.net.URL
-import java.util.Base64
 import java.util.UUID
 
 const val DEFAULT_SERVICE_URL = "https://api.trycloudflare.com"
@@ -72,7 +71,7 @@ private fun tryOnce(url: String, userAgent: String, timeoutMs: Int): QuickTunnel
     val r = root["result"]?.jsonObject ?: throw TunnelException.Internal("POST /tunnel returned success=true but no `result` body")
     fun str(k: String) = r[k]?.jsonPrimitive?.content ?: throw TunnelException.Internal("missing '$k' in /tunnel result")
     val id = try { UUID.fromString(str("id")) } catch (e: IllegalArgumentException) { throw TunnelException.Internal("tunnel.id is not a uuid", e) }
-    return QuickTunnel(id, str("hostname"), str("account_tag"), Base64.getDecoder().decode(str("secret")))
+    return QuickTunnel(id, str("hostname"), str("account_tag"), Base64Lite.decode(str("secret")))
 }
 
 private fun JsonArray?.orEmpty(): List<kotlinx.serialization.json.JsonElement> = this?.toList() ?: emptyList()

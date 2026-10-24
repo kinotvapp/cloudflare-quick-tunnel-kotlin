@@ -55,3 +55,22 @@ The reply is the same preamble + `ConnectResponse` (`error ptr0`, `metadata ptr1
 - Requests with `Content-Length` arrive as that many raw bytes. A chunked upload arrives already chunk-framed, with
   `Content-Length` set to the framed size, which is what `cloudflared` forwards too.
 - A `HEAD`, `204` or `304` response ends right after the head even when it advertises a `Content-Length`.
+
+## HTTP/2 transport (TCP fallback)
+
+Same port, different wire. Mirrors `connection/http2.go` and `connection/header.go` in `cloudflared`.
+
+- **Connect:** TCP to the edge, TLS with SNI `h2.cftunnel.com`, the same pinned CAs, **no ALPN**.
+- **Roles are reversed:** after the handshake the edge is the HTTP/2 *client* and we are the *server*. We write nothing until
+  the client preface arrives; then we send SETTINGS.
+- **Control stream:** the first request has `Cf-Cloudflared-Proxy-Connection-Upgrade: control-stream`. Answer `200` and run the
+  same Cap'n Proto RPC as on QUIC over its body (request body = edge to us, response body = us to edge).
+- **Other `Cf-Cloudflared-Proxy-Connection-Upgrade` values:** `websocket`, and `update-configuration` (answer with JSON; we
+  report that remote configuration is unsupported). A request with `Cf-Cloudflared-Proxy-Src` is a warp-routing TCP stream.
+- **Requests** are ordinary HTTP/2 requests: `:method`, `:path`, `:authority` plus headers. Hop-by-hop headers do not exist in
+  HTTP/2, so for a WebSocket we restore `Connection: Upgrade` and `Upgrade: websocket` before talking HTTP/1.1 to the origin.
+  A request without `Content-Length` and without END_STREAM has a body of unknown length: re-chunk it for the origin.
+- **Responses:** real `:status` (101 becomes 200) and `content-length`; every other origin header travels in one header,
+  `cf-cloudflared-response-headers`, as `base64raw(name):base64raw(value)` pairs joined by `;`. Add
+  `cf-cloudflared-response-meta: {"src":"origin"}` (`"cloudflared"` for errors we generate, with a 502).
+- **Not needed:** a dynamic table in our HPACK encoder (literals without indexing are valid for any peer table size).

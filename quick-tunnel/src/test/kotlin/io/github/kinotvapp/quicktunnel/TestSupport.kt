@@ -48,13 +48,14 @@ class FakeOrigin(val handler: (method: String, path: String, headers: Map<String
     val server = ServerSocket(0, 50, java.net.InetAddress.getByName("127.0.0.1"))
     val port get() = server.localPort
     @Volatile var accepted = 0
-    private val sockets = java.util.Collections.synchronizedList(mutableListOf<Socket>())
+    // Iterated by closeClients() while the accept thread appends: a plain synchronized list throws ConcurrentModificationException.
+    private val sockets = java.util.concurrent.CopyOnWriteArrayList<Socket>()
 
     init {
         thread(isDaemon = true) {
             while (!server.isClosed) {
                 val s = try { server.accept() } catch (_: Exception) { break }
-                accepted++; sockets += s
+                sockets += s; accepted++ // register before counting, so a test that waits on `accepted` can close it
                 thread(isDaemon = true) { serve(s) }
             }
         }
@@ -67,7 +68,8 @@ class FakeOrigin(val handler: (method: String, path: String, headers: Map<String
             val (method, path) = first.split(' ').let { it[0] to it[1] }
             val headers = mutableMapOf<String, String>()
             while (true) { val l = readLine(inp) ?: break; if (l.isEmpty()) break; headers[l.substringBefore(':').lowercase()] = l.substringAfter(':').trim() }
-            val body = headers["content-length"]?.toInt()?.let { n -> ByteArray(n).also { inp.readFully(it) } } ?: ByteArray(0)
+            val body = if (headers["transfer-encoding"]?.contains("chunked", true) == true) ChunkedInputStream(inp).readBytes()
+                else headers["content-length"]?.toInt()?.let { n -> ByteArray(n).also { inp.readFully(it) } } ?: ByteArray(0)
             val keep = handler(method, path, headers, body, s.getOutputStream())
             s.getOutputStream().flush()
             if (!keep) break
@@ -79,6 +81,9 @@ class FakeOrigin(val handler: (method: String, path: String, headers: Map<String
         val sb = StringBuilder()
         while (true) { val c = i.read(); if (c < 0) return if (sb.isEmpty()) null else sb.toString(); if (c == '\n'.code) return sb.toString().trimEnd('\r'); sb.append(c.toChar()) }
     }
+
+    /** A client's connect() completes in the kernel backlog before this thread has accepted it: wait for the accept. */
+    fun awaitAccepted(n: Int) { val end = System.currentTimeMillis() + 5000; while (accepted < n && System.currentTimeMillis() < end) Thread.sleep(5); check(accepted >= n) { "origin accepted $accepted of $n connections" } }
 
     fun closeClients() = sockets.forEach { runCatching { it.close() } }
     override fun close() { runCatching { server.close() }; closeClients() }

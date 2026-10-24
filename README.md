@@ -20,28 +20,29 @@ Working end to end: a request to the public URL reaches a server on the device a
 
 | Where | What was verified |
 |---|---|
-| JDK 17, macOS | Full flow, HA failover, reconnect, 20 MB download and 5 MB upload with identical checksums |
+| JDK 17, macOS | Full flow over **both transports**, HA failover, reconnect, 20 MB download and 5 MB upload with identical checksums, WebSocket echo over HTTP/2 |
 | Android 14 emulator (API 34, arm64) | Full flow; switching Wi-Fi off and on: ~4 s and ~2 s outages, both connections re-register on their own; R8-minified release build |
 | Samsung S24+ (Android 16) | Full flow with the app in the background (foreground service): tunnel up in 4.6 s, 30/30 requests answered, no reconnects needed |
 
 ## Limitations
 
-- **QUIC only, which means outbound UDP to port 7844.** There is no fallback to HTTP/2 over TCP, which `cloudflared`
-  uses when UDP is blocked. On a network that blocks that port (some corporate, hotel and captive-portal Wi-Fi, some
-  carriers) `start()` fails with `TunnelException.QuicDial` after the handshake timeout, and a running tunnel cannot
-  recover until the network allows UDP again. Only DNS discovery has a TCP/DNS-over-TLS fallback, not the tunnel itself.
+- **If both UDP and TCP to port 7844 are blocked, there is no fallback.** The tunnel needs outbound access to the edge on
+  that port: UDP for QUIC, or TCP for the HTTP/2 transport (see [Transports](#transports)). Networks that only allow
+  80/443 are out.
+- The HTTP/2 transport does not carry raw TCP streams (cloudflared's warp-routing); HTTP and WebSocket work.
 - Quick tunnels are anonymous and rate-limited; named tunnels (Cloudflare account + token) are out of scope.
-- No UDP/ICMP proxying (`datagram` v2/v3); HTTP, WebSocket and raw TCP streams only.
+- No UDP/ICMP proxying (`datagram` v2/v3).
 
-Not verified: Android below API 34 (see [Android notes](#android-notes)), networks that block UDP 7844, IPv6-only networks, long runs (hours), doze mode.
-73 unit tests run without network access (`./gradlew :quick-tunnel:test`).
+Not verified: Android below API 34 (see [Android notes](#android-notes)), a network that really blocks UDP 7844 (the fallback decision is covered by unit tests, and the HTTP/2 transport was verified on its own against the real edge), IPv6-only networks, long runs (hours), doze mode.
+129 unit tests run without network access (`./gradlew :quick-tunnel:test`).
 
 ## What it does
 
 - `POST /tunnel` against the quick-tunnel API with retries (1 s, 2 s, 4 s on network errors and 5xx).
 - Edge discovery through DNS SRV (`_v2-origintunneld._tcp.argotunnel.com`) with a UDP, TCP and DNS-over-TLS
   fallback chain, a one-hour cache, and an IPv4/IPv6 filter.
-- QUIC handshake against the edge (ALPN `argotunnel`, SNI `quic.cftunnel.com`, Cloudflare's internal CAs pinned).
+- QUIC handshake against the edge (ALPN `argotunnel`, SNI `quic.cftunnel.com`, Cloudflare's internal CAs pinned), with an
+  automatic fallback to HTTP/2 over TCP when UDP is blocked.
 - `registerConnection` over a hand-written Cap'n Proto RPC client, including the stub bootstrap the edge needs to
   consider the tunnel alive. No Cap'n Proto compiler or runtime dependency.
 - High availability: 2 connections by default (up to 4) on distinct `conn_index` values, so one dropped connection
@@ -52,12 +53,28 @@ Not verified: Android below API 34 (see [Android notes](#android-notes)), networ
 - Graceful shutdown (`unregisterConnection`), metrics (`streams`, `bytesIn`, `bytesOut`, `reconnects`), typed errors,
   `AutoCloseable`.
 
+## Transports
+
+| | Wire | Needs |
+|---|---|---|
+| **QUIC** | QUIC + TLS 1.3, ALPN `argotunnel`, SNI `quic.cftunnel.com` | outbound **UDP** 7844 |
+| **HTTP/2** | TLS over **TCP** 7844, SNI `h2.cftunnel.com`, then the edge speaks HTTP/2 to us (we are the server on that connection, as in `cloudflared --protocol http2`) | outbound **TCP** 7844 |
+
+`TransportPolicy.AUTO` (the default) tries QUIC on two edges with a 4 s handshake each, then HTTP/2 on up to five. When
+that happens `TunnelListener.onTransportFallback` fires, and the next reconnections go straight to HTTP/2 for 10 minutes
+before QUIC is tried again, so a blocked network does not cost a timeout on every reconnect. `QUIC_ONLY` and `HTTP2_ONLY`
+force one of them. `handle.transports` tells which one each connection is using.
+
+The HTTP/2 transport is a small server written for this library (`Http2.kt`): SETTINGS, HEADERS/CONTINUATION, DATA,
+flow control in both directions, PING, RST_STREAM, GOAWAY. HPACK decoding uses `com.twitter:hpack`.
+
 ## Usage
 
 ```kotlin
 val manager = QuickTunnelManager(
     localPort = 8080,
     haConnections = 2,                          // 1..4
+    transport = TransportPolicy.AUTO,           // or QUIC_ONLY / HTTP2_ONLY
     ipVersion = IpVersionFilter.AUTO,           // or V4_ONLY / V6_ONLY
     firstConnectTimeoutMs = 30_000,
     maxReconnectAttempts = Int.MAX_VALUE,       // the Rust crate stops after 10; a phone should keep trying

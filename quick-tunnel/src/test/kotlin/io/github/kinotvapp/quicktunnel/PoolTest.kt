@@ -10,6 +10,16 @@ import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 class PoolTest {
+    /** Closing a socket while another thread is blocked reading it sends the FIN a little later: wait until it shows. */
+    private fun awaitEof(s: java.net.Socket) {
+        val deadline = System.currentTimeMillis() + 5000
+        s.soTimeout = 20
+        while (System.currentTimeMillis() < deadline) {
+            try { if (s.getInputStream().read() < 0) return } catch (_: java.net.SocketTimeoutException) { /* not yet */ } catch (_: java.io.IOException) { return }
+        }
+        error("the origin's close never reached the client socket")
+    }
+
     private fun origin() = FakeOrigin { _, _, _, _, out -> out.respond("200 OK", ByteArray(0)); true }
 
     @Test fun `released sockets come back last-in first-out`() {
@@ -48,7 +58,7 @@ class PoolTest {
         origin().use { o ->
             val pool = LocalPool(o.port)
             val a = pool.acquire(); pool.release(a)
-            o.closeClients(); Thread.sleep(100)
+            o.awaitAccepted(1); o.closeClients(); awaitEof(a.socket)
             val b = pool.acquire()
             assertFalse(b.reused); assertNotSame(a.socket, b.socket)
             pool.close()

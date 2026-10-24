@@ -17,17 +17,13 @@ import kotlin.test.assertTrue
 /** What the edge sees of one registerConnection call. */
 class SeenCall(val question: Int, val target: Int, val iface: Long, val method: Int, val params: StructR?)
 
-/** A scripted edge on the far side of two pipes: answers Bootstrap and Calls the way cloudflared's edge does. */
-class FakeEdge(private val respond: (SeenCall, CapnpBuilder) -> Boolean) {
-    private val c2e = PipedOutputStream(); private val e2c = PipedOutputStream()
-    private val edgeIn = PipedInputStream(c2e, 1 shl 16); private val clientIn = PipedInputStream(e2c, 1 shl 16)
-    val clientOut get() = c2e
-    val clientInput get() = clientIn
+/** The edge's end of a control stream, over any pair of streams: answers Bootstrap and Calls like cloudflared's edge. */
+class RpcPeer(edgeIn: java.io.InputStream, private val toClient: java.io.OutputStream, respond: (SeenCall, RpcPeer) -> Boolean) {
     val calls = CopyOnWriteArrayList<SeenCall>()
     val returnsFromClient = CopyOnWriteArrayList<StructR>()
     val exportId = 7
 
-    private fun send(b: CapnpBuilder) { e2c.write(b.frame()); e2c.flush() }
+    @Synchronized fun reply(b: CapnpBuilder) { toClient.write(b.frame()); toClient.flush() }
 
     fun returnBootstrap(q: Int) = CapnpBuilder().apply {
         val m = root(1, 1); u16(m, 0, 3); val ret = struct(m + 1, 2, 1); u32(ret, 0, q); u16(ret, 6, 0)
@@ -35,29 +31,45 @@ class FakeEdge(private val respond: (SeenCall, CapnpBuilder) -> Boolean) {
         val cap = structList(payload + 1, 1, 1, 1); u16(cap, 0, 1); u32(cap, 4, exportId)
     }
 
-    private val loop = thread(isDaemon = true) {
-        try {
-            while (true) {
-                val root = CapnpMessage.read(edgeIn).root() ?: break
-                val body = root.struct(0)
-                when (root.u16(0)) {
-                    8 -> send(returnBootstrap(body!!.u32(0)))
-                    2 -> {
-                        val c = SeenCall(body!!.u32(0), body.struct(0)!!.u32(0), body.u64(8), body.u16(4), body.struct(1)?.struct(0))
-                        calls += c
-                        if (!respond(c, CapnpBuilder())) continue
+    init {
+        thread(isDaemon = true) {
+            try {
+                while (true) {
+                    val root = CapnpMessage.read(edgeIn).root() ?: break
+                    val body = root.struct(0)
+                    when (root.u16(0)) {
+                        8 -> reply(returnBootstrap(body!!.u32(0)))
+                        2 -> {
+                            val c = SeenCall(body!!.u32(0), body.struct(0)!!.u32(0), body.u64(8), body.u16(4), body.struct(1)?.struct(0))
+                            calls += c
+                            respond(c, this)
+                        }
+                        3 -> returnsFromClient += body!!
                     }
-                    3 -> returnsFromClient += body!!
                 }
-            }
-        } catch (_: Exception) { /* pipe closed */ }
+            } catch (_: Exception) { /* stream closed */ }
+        }
     }
 
-    fun reply(b: CapnpBuilder) = send(b)
-    fun askClientBootstrap(q: Int) = send(CapnpBuilder().apply { val m = root(1, 1); u16(m, 0, 8); val b = struct(m + 1, 1, 1); u32(b, 0, q) })
-    fun callClient(q: Int, target: Int) = send(CapnpBuilder().apply {
+    fun askClientBootstrap(q: Int) = reply(CapnpBuilder().apply { val m = root(1, 1); u16(m, 0, 8); val b = struct(m + 1, 1, 1); u32(b, 0, q) })
+    fun callClient(q: Int, target: Int) = reply(CapnpBuilder().apply {
         val m = root(1, 1); u16(m, 0, 2); val c = struct(m + 1, 3, 3); u32(c, 0, q); struct(c + 3, 1, 1).also { u32(it, 0, target) }; struct(c + 4, 0, 2)
     })
+}
+
+/** A scripted edge on the far side of two pipes (the QUIC-style control stream). */
+class FakeEdge(respond: (SeenCall, CapnpBuilder) -> Boolean) {
+    private val c2e = PipedOutputStream(); private val e2c = PipedOutputStream()
+    private val edgeIn = PipedInputStream(c2e, 1 shl 16); private val clientIn = PipedInputStream(e2c, 1 shl 16)
+    val clientOut get() = c2e
+    val clientInput get() = clientIn
+    private val peer = RpcPeer(edgeIn, e2c) { c, _ -> respond(c, CapnpBuilder()) }
+    val calls get() = peer.calls
+    val returnsFromClient get() = peer.returnsFromClient
+    val exportId get() = peer.exportId
+    fun reply(b: CapnpBuilder) = peer.reply(b)
+    fun askClientBootstrap(q: Int) = peer.askClientBootstrap(q)
+    fun callClient(q: Int, target: Int) = peer.callClient(q, target)
     fun closeFromEdge() = e2c.close()
 }
 
