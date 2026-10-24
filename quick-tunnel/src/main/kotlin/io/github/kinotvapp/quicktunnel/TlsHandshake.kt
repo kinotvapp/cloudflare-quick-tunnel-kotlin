@@ -181,7 +181,6 @@ internal class Tls13ClientHandshake(
     val isComplete: Boolean get() = state == State.CONNECTED
 
     init {
-        EcParametersPolyfill.ensureInstalled()
         if (TlsHostname.isIpLiteral(serverName)) { peerName = serverName; sendSni = false }
         else { peerName = TlsHostname.normalize(serverName) ?: throw IllegalArgumentException("invalid server name: $serverName"); sendSni = true }
     }

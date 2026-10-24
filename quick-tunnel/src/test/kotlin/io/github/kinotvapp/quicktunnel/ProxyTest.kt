@@ -131,7 +131,7 @@ class ProxyTest {
         thread(isDaemon = true) {
             server.accept().use { s ->
                 val i = s.getInputStream(); val buf = ByteArrayOutputStream()
-                while (!buf.toString(Charsets.ISO_8859_1).contains("\r\n\r\n")) buf.write(i.read())
+                while (!String(buf.toByteArray(), Charsets.ISO_8859_1).contains("\r\n\r\n")) buf.write(i.read())
                 s.getOutputStream().write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n".toByteArray())
                 val echo = i.readBytes() // until the proxy half-closes after the edge's bytes
                 s.getOutputStream().write("echo:".toByteArray() + echo)

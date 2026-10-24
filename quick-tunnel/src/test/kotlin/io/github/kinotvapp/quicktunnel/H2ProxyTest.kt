@@ -134,8 +134,8 @@ class H2ProxyTest {
         thread(isDaemon = true) {
             server.accept().use { s ->
                 val i = s.getInputStream(); val buf = java.io.ByteArrayOutputStream()
-                while (!buf.toString(Charsets.ISO_8859_1).contains("\r\n\r\n")) buf.write(i.read())
-                originSaw.complete(buf.toString(Charsets.ISO_8859_1))
+                while (!String(buf.toByteArray(), Charsets.ISO_8859_1).contains("\r\n\r\n")) buf.write(i.read())
+                originSaw.complete(String(buf.toByteArray(), Charsets.ISO_8859_1))
                 s.getOutputStream().write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: abc\r\n\r\n".toByteArray())
                 val b = ByteArray(1024)
                 while (true) { val n = i.read(b); if (n < 0) break; s.getOutputStream().write("echo:".toByteArray() + b.copyOf(n)); s.getOutputStream().flush() }

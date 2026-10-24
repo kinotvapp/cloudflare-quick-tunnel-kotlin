@@ -2,13 +2,15 @@
 
 What was not obvious from `cloudflared`'s source. Layouts were taken from the Go code generated from the schemas.
 
+The library only implements the TCP/HTTP/2 transport now. The QUIC details below (ALPN, `quic.cftunnel.com`, the per-request stream framing) are kept as a reference for the version up to commit `3b93d99`, which used Kwik.
+
 ## Handshake
 
 | | |
 |---|---|
 | Edge list | SRV `_v2-origintunneld._tcp.argotunnel.com`, port 7844 |
-| ALPN | `argotunnel` |
-| SNI | `quic.cftunnel.com` (**not** the ALPN string, and it does not resolve in DNS: connect to the edge IP and keep this as the server name. In Kwik: `.host(SNI).proxy(ip)`) |
+| ALPN | QUIC: `argotunnel`. TCP/HTTP/2: none |
+| SNI | QUIC: `quic.cftunnel.com`; TCP/HTTP/2: `h2.cftunnel.com`. **Not** the ALPN string, and neither resolves in DNS: connect to the edge IP and keep this as the server name |
 | Trust | The three Cloudflare-internal CAs; system roots are not enough |
 
 A wrong SNI looks like a 10 s silence, with no TLS alert.

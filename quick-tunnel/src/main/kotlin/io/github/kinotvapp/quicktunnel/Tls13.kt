@@ -248,7 +248,6 @@ internal class Tls13Connection private constructor(private val socket: Socket) :
 
         /** Runs the TLS 1.3 handshake on an already connected [socket] (SNI [serverName], certificates checked by [trust] and matched to the name). */
         fun connect(socket: Socket, serverName: String, trust: X509TrustManager, handshakeTimeoutMs: Int, random: SecureRandom = SecureRandom()): Tls13Connection {
-            EcParametersPolyfill.ensureInstalled()
             val c = Tls13Connection(socket)
             try {
                 socket.soTimeout = handshakeTimeoutMs

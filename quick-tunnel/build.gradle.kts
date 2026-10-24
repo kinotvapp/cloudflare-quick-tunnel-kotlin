@@ -12,14 +12,14 @@ dependencies {
     testImplementation(kotlin("test"))
 }
 
-java { sourceCompatibility = JavaVersion.VERSION_11; targetCompatibility = JavaVersion.VERSION_11 }
+java { sourceCompatibility = JavaVersion.VERSION_1_8; targetCompatibility = JavaVersion.VERSION_1_8 }
 
 kotlin {
     jvmToolchain(17)
     compilerOptions {
-        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_11)
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_1_8)
         // Fail the build on JDK APIs Android lacks (e.g. ByteBuffer.get(int, byte[]) is Java 13+).
-        freeCompilerArgs.add("-Xjdk-release=11")
+        freeCompilerArgs.add("-Xjdk-release=1.8")
     }
 }
 
