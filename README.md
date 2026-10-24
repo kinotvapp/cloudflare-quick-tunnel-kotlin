@@ -24,7 +24,16 @@ Working end to end: a request to the public URL reaches a server on the device a
 | Android 14 emulator (API 34, arm64) | Full flow; switching Wi-Fi off and on: ~4 s and ~2 s outages, both connections re-register on their own; R8-minified release build |
 | Samsung S24+ (Android 16) | Full flow with the app in the background (foreground service): tunnel up in 4.6 s, 30/30 requests answered, no reconnects needed |
 
-Not verified: Android below API 34 (see [Android notes](#android-notes)), IPv6-only networks, long runs (hours), doze mode.
+## Limitations
+
+- **QUIC only, which means outbound UDP to port 7844.** There is no fallback to HTTP/2 over TCP, which `cloudflared`
+  uses when UDP is blocked. On a network that blocks that port (some corporate, hotel and captive-portal Wi-Fi, some
+  carriers) `start()` fails with `TunnelException.QuicDial` after the handshake timeout, and a running tunnel cannot
+  recover until the network allows UDP again. Only DNS discovery has a TCP/DNS-over-TLS fallback, not the tunnel itself.
+- Quick tunnels are anonymous and rate-limited; named tunnels (Cloudflare account + token) are out of scope.
+- No UDP/ICMP proxying (`datagram` v2/v3); HTTP, WebSocket and raw TCP streams only.
+
+Not verified: Android below API 34 (see [Android notes](#android-notes)), networks that block UDP 7844, IPv6-only networks, long runs (hours), doze mode.
 73 unit tests run without network access (`./gradlew :quick-tunnel:test`).
 
 ## What it does
